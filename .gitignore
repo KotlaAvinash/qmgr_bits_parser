@@ -20,3 +20,7 @@ local_expectations.json
 
 # ad-hoc screenshots (curated ones live in docs/)
 /*.png
+.venv*/
+build/
+dist/
+*.egg-info/

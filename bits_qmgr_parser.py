@@ -15,6 +15,8 @@ constants; verified byte-by-byte against a real Windows 11 queue.
 """
 import argparse, csv, datetime as dt, hashlib, json, os, re, struct, sys, uuid
 
+__version__ = "1.1.0"
+
 JOB_DELIMS = [bytes.fromhex(h) for h in (
     "a15609e143afc94292e66f9856eba7f6", "9f95d44c6470f24b84d7476a7e62699f",
     "f11926a93203bf4c9427898818958831", "c133bcddfb5aaf4db8a12268b39d01ad",
@@ -84,6 +86,71 @@ def filetime(v):
     if not v or v < 0x0100000000000000 or v > 0x0200000000000000:
         return None
     return (dt.datetime(1601, 1, 1) + dt.timedelta(microseconds=v // 10)).isoformat() + "Z"
+
+
+def sid_str(b, off=0):
+    """Binary SID -> 'S-1-...'; returns (string, length) or (None, 0)."""
+    if len(b) < off + 8 or b[off] != 1:
+        return None, 0
+    n = b[off + 1]
+    if n > 15 or len(b) < off + 8 + 4 * n:
+        return None, 0
+    auth = int.from_bytes(b[off + 2:off + 8], "big")
+    subs = struct.unpack_from("<%dI" % n, b, off + 8)
+    return "S-1-%d%s" % (auth, "".join("-%d" % s for s in subs)), 8 + 4 * n
+
+
+def _sddl_windows(sd):
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = ctypes.WinDLL("advapi32")
+        fn = adv.ConvertSecurityDescriptorToStringSecurityDescriptorW
+        fn.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                       ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.ULONG)]
+        buf = ctypes.create_string_buffer(sd)
+        if not adv.IsValidSecurityDescriptor(buf):
+            return None
+        out, n = wintypes.LPWSTR(), wintypes.ULONG()
+        if not fn(buf, 1, 0x1 | 0x2 | 0x4, ctypes.byref(out), ctypes.byref(n)):
+            return None
+        s = out.value
+        ctypes.windll.kernel32.LocalFree(out)
+        return s
+    except (OSError, AttributeError, ImportError):
+        return None
+
+
+def decode_sd(sd):
+    """Self-relative SECURITY_DESCRIPTOR -> owner/group SIDs, DACL ACEs, SDDL (Windows)."""
+    out = {}
+    try:
+        _, _, _ctl, o_own, o_grp, _o_sacl, o_dacl = struct.unpack_from("<BBHIIII", sd, 0)
+    except struct.error:
+        return out
+    if o_own:
+        out["sd_owner_sid"] = sid_str(sd, o_own)[0]
+    if o_grp:
+        out["sd_group_sid"] = sid_str(sd, o_grp)[0]
+    aces = []
+    if o_dacl and o_dacl + 8 <= len(sd):
+        _rev, _z, _size, count, _z2 = struct.unpack_from("<BBHHH", sd, o_dacl)
+        p = o_dacl + 8
+        for _ in range(min(count, 64)):
+            if p + 8 > len(sd):
+                break
+            typ, _flags, size = struct.unpack_from("<BBH", sd, p)
+            mask = struct.unpack_from("<I", sd, p + 4)[0]
+            if typ in (0, 1):
+                aces.append("%s 0x%08X %s" % ("allow" if typ == 0 else "deny", mask, sid_str(sd, p + 8)[0]))
+            if size < 8:
+                break
+            p += size
+    out["sd_dacl"] = aces
+    sddl = _sddl_windows(sd) if os.name == "nt" else None
+    if sddl:
+        out["sd_sddl"] = sddl
+    return out
 
 
 class Reader:
@@ -157,6 +224,13 @@ def parse_job(buf, off=0, end=None):
     # access token / security descriptor up to the transfer header
     lim = min(r.end, r.o + 8192)
     x = bytes(buf[r.o:lim]).find(XFER_HDR)
+    if x >= 24:
+        # [measured] 5 x u32 (unknown), u32 sd_len, self-relative SECURITY_DESCRIPTOR
+        region = bytes(buf[r.o:r.o + x])
+        sd_len = struct.unpack_from("<I", region, 20)[0]
+        sd = region[24:24 + sd_len]
+        if sd_len >= 20 and len(sd) == sd_len and sd[0] == 1:
+            j.update(decode_sd(sd))
     if x < 0:
         j["_partial"] = "no transfer header after SID"
         return j, r.o
@@ -475,6 +549,10 @@ def triage(job, files):
         if remote and not benign_host(remote) and not host.startswith("127.") and \
                 host not in ("localhost", ""):
             flags.append("INFO: non-allowlisted host " + host)
+    if job.get("sd_owner_sid") and job.get("owner_sid") and job["sd_owner_sid"] != job["owner_sid"]:
+        flags.append("MED: job security-descriptor owner %s differs from job owner %s (take-over/tamper?)"
+                     % (job["sd_owner_sid"], job["owner_sid"]))
+    flags += file_status_flags(files)
     if not any(x.split(":")[0] in ("HIGH", "MED", "REVIEW") for x in flags):
         hosts_ok = files and all(benign_host(_remote_local(f)[0]) for f in files)
         if hosts_ok or (not files and BENIGN_CREATORS.match(creator or "")):
@@ -512,13 +590,18 @@ def _walk(input_dir):
                 yield p, os.path.relpath(p, input_dir)
 
 
-def analyse(input_dir, no_carve=False, progress=None, events=None):
-    """Parse + carve a Downloader folder (recursively). Any *.evtx in it is read as a
-    BITS-Client log. `events` = extra pre-read events (e.g. live log) to correlate."""
+def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=None, mft_drive="C:"):
+    """Parse + carve a collection folder (recursively).
+
+    Recognised anywhere below input_dir: qmgr.db, edb*/jrs logs (carved), $I30*, *.evtx
+    (BITS-Client -> events; PowerShell/other channels -> BITS command hunting),
+    ConsoleHost_history.txt (PSReadLine), MFTECmd $MFT CSV, *.FileSlack.
+    `events`     extra pre-read BITS events (e.g. the live log) to correlate.
+    `mount_root` mounted image root: check whether each job's local file exists + hash."""
     say = progress or (lambda m: None)
     inventory, all_jobs, all_files, notes = [], [], [], []
     ese_files = {}
-    i30, slack, evtx_events = [], {}, []
+    i30, slack, evtx_events, commands, mft_csvs = [], {}, [], [], []
     for p, rel in _walk(input_dir):
         fn = os.path.basename(p)
         low = fn.lower()
@@ -538,9 +621,20 @@ def analyse(input_dir, no_carve=False, progress=None, events=None):
         if low.endswith(".evtx"):
             say("reading event log " + rel)
             try:
-                evtx_events += read_events(path=p)
+                evs = read_events(path=p, match=BITS_CMD_RE.pattern)
+                evtx_events += [e for e in evs if "bits-client" in (e.get("channel") or "").lower()]
+                commands += commands_from_events(
+                    [e for e in evs if "bits-client" not in (e.get("channel") or "").lower()])
             except Exception as e:
                 notes.append("event log %s: %s" % (rel, e))
+            continue
+        if low == "consolehost_history.txt":
+            commands += scan_ps_history(p); continue
+        if low.endswith(".csv"):
+            if is_mftecmd_csv(p):
+                mft_csvs.append(p)
+            continue
+        if low.endswith((".txt", ".json", ".md")):
             continue
         if not no_carve and not low.endswith((".chk", ".jfm")):
             say("carving " + rel)
@@ -571,12 +665,21 @@ def analyse(input_dir, no_carve=False, progress=None, events=None):
 
     all_events = evtx_events + list(events or [])
     jobs = correlate(jobs, all_events, "event log only")
+    if mount_root:
+        say("checking local files under " + mount_root)
+        check_files(jobs, mount_root)
+    for c in mft_csvs:
+        say("correlating $MFT CSV " + os.path.basename(c))
+        try:
+            notes.append("$MFT CSV %s: %d matches" % (os.path.basename(c), correlate_mft(jobs, c, mft_drive)))
+        except Exception as e:
+            notes.append("$MFT CSV %s: %s" % (os.path.basename(c), e))
     for j in jobs:
         retriage(j)
     jobs.sort(key=lambda j: (j.get("created") or "", j.get("modified") or ""))
     latest = latest_per_job(jobs)
 
-    return {"tool": "bits_qmgr_parser",
+    return {"tool": "bits_qmgr_parser", "version": __version__,
             "run_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "input": os.path.abspath(input_dir), "inventory": inventory,
             "summary": {"job_records": len(jobs), "unique_jobs": len(latest),
@@ -588,8 +691,10 @@ def analyse(input_dir, no_carve=False, progress=None, events=None):
                         "events": len(all_events),
                         "file_records": len(files), "i30_entries": len(i30),
                         "flagged_jobs": len({j["job_id"] for j in latest
-                                             if j["level"] in ("HIGH", "MED", "REVIEW")})},
+                                             if j["level"] in ("HIGH", "MED", "REVIEW")}),
+                        "commands": len(commands)},
             "jobs": jobs, "latest": latest, "files": files, "i30": i30, "events": all_events,
+            "commands": commands, "do_downloads": [],
             "fileslack_urls": slack, "parse_notes": notes}
 
 
@@ -645,6 +750,17 @@ def write_outputs(result, out_dir):
                   "record", "source", "message"]
             w = csv.DictWriter(fh, ec, extrasaction="ignore"); w.writeheader()
             w.writerows(row_safe(e) for e in result["events"])
+    if result.get("commands"):
+        with open(os.path.join(out_dir, "bits_commands.csv"), "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.DictWriter(fh, ["level", "time", "kind", "text", "source", "record", "line_no"],
+                               extrasaction="ignore"); w.writeheader()
+            w.writerows(row_safe(c) for c in result["commands"])
+    if result.get("do_downloads"):
+        with open(os.path.join(out_dir, "delivery_optimization.csv"), "w", newline="", encoding="utf-8-sig") as fh:
+            dc = ["level", "status", "caller", "host", "source_url", "size", "downloaded", "from_http",
+                  "from_peers", "mode", "priority", "cache_host", "expires", "duration", "file_id"]
+            w = csv.DictWriter(fh, dc, extrasaction="ignore"); w.writeheader()
+            w.writerows(row_safe(d) for d in result["do_downloads"])
 
 
 # ---------------------------------------------------------------- event log
@@ -656,13 +772,18 @@ EVENT_WHAT = {3: "job created", 4: "job completed", 5: "job cancelled", 6: "noti
 EVENTS_PS = r"""
 $ErrorActionPreference='Stop'
 $p = @{}
-if ($env:BITS_EVTX_PATH) { $p['Path'] = $env:BITS_EVTX_PATH } else { $p['LogName'] = 'Microsoft-Windows-Bits-Client/Operational' }
+if ($env:BITS_EVTX_PATH) { $p['Path'] = $env:BITS_EVTX_PATH }
+else { $p['LogName'] = $(if ($env:BITS_EVT_LOG) { $env:BITS_EVT_LOG } else { 'Microsoft-Windows-Bits-Client/Operational' }) }
 try { $ev = @(Get-WinEvent @p -Oldest) } catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $ev=@() } else { throw } }
+$rx = $env:BITS_EVT_MATCH
 @($ev | ForEach-Object {
-  $x = [xml]$_.ToXml(); $d = @{}
+  $xml = $_.ToXml(); $x = [xml]$xml; $ch = [string]$x.Event.System.Channel
+  if ($rx -and $ch -notlike '*Bits-Client*' -and $xml -notmatch $rx) { return }
+  $d = @{}
   foreach ($n in $x.Event.EventData.Data) { if ($n.Name) { $d[$n.Name] = $n.'#text' } }
   $m = ''; try { $m = ($_.Message -split "`r?`n")[0] } catch {}
-  [pscustomobject]@{ id=$_.Id; time=$_.TimeCreated.ToUniversalTime().ToString('o'); record=$_.RecordId; data=$d; message=$m }
+  [pscustomobject]@{ id=$_.Id; time=$_.TimeCreated.ToUniversalTime().ToString('o'); record=$_.RecordId;
+                     channel=$ch; data=$d; message=$m }
 }) | ConvertTo-Json -Depth 4 -Compress
 """
 
@@ -670,9 +791,11 @@ try { $ev = @(Get-WinEvent @p -Oldest) } catch { if ($_.FullyQualifiedErrorId -l
 def _ps(script, env_extra=None, timeout=180):
     import subprocess
     env = dict(os.environ)
-    env.pop("BITS_EVTX_PATH", None)
+    for k in ("BITS_EVTX_PATH", "BITS_EVT_LOG", "BITS_EVT_MATCH"):
+        env.pop(k, None)
     env.update(env_extra or {})
-    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+    exe = "powershell" if os.name == "nt" else "pwsh"
+    out = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-Command", script],
                          capture_output=True, text=True, encoding="utf-8", errors="replace",
                          timeout=timeout, env=env,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -702,19 +825,28 @@ def normalize_event(e, source):
             "parameters": d.get("parameters") or "", "owner": d.get("jobOwner") or d.get("User") or "",
             "hr": hr if hr not in ("0x00000000",) else "", "bytes_total": d.get("bytesTotal"),
             "bytes_transferred": d.get("bytesTransferred"), "record": e.get("record"),
+            "channel": e.get("channel") or "Microsoft-Windows-Bits-Client/Operational",
+            "script": d.get("ScriptBlockText") or d.get("Payload") or d.get("ContextInfo") or "",
             "source": source, "message": e.get("message") or ""}
 
 
-def read_events(path=None, raw_json=None):
-    """BITS-Client/Operational events: live log (path=None) or an exported .evtx."""
-    txt = raw_json if raw_json is not None else \
-        _ps(EVENTS_PS, {"BITS_EVTX_PATH": os.path.abspath(path)} if path else None)
+def read_events(path=None, raw_json=None, log=None, match=None):
+    """Event records from the live BITS-Client log (default), another live `log`, or an .evtx.
+    `match`: regex; events from non-BITS channels are only returned if their XML matches."""
+    env = {}
+    if path:
+        env["BITS_EVTX_PATH"] = os.path.abspath(path)
+    if log:
+        env["BITS_EVT_LOG"] = log
+    if match:
+        env["BITS_EVT_MATCH"] = match
+    txt = raw_json if raw_json is not None else _ps(EVENTS_PS, env or None)
     if not txt:
         return []
     data = json.loads(txt)
     if isinstance(data, dict):
         data = [data]
-    src = ("evtx:" + os.path.basename(path)) if path else "eventlog:live"
+    src = ("evtx:" + os.path.basename(path)) if path else ("eventlog:live" if not log else "live:" + log)
     return [normalize_event(e, src) for e in data]
 
 
@@ -799,9 +931,28 @@ def live_snapshot():
         for j in jobs:
             j.setdefault("notes", []).append("event log unavailable: %s" % e)
     jobs = correlate(jobs, events, "event log only (live)")
-    for j in jobs:
-        retriage(j)
+    check_files(jobs)                       # live disk: does the payload still exist? hash it
     return jobs, events
+
+
+def live_extras():
+    """Other no-admin sources on this PC: PSReadLine history, PowerShell/Operational
+    script blocks that mention BITS, Delivery Optimization cache. Never raises."""
+    out = {"commands": [], "do_downloads": [], "notes": []}
+    hist = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "PowerShell",
+                        "PSReadLine", "ConsoleHost_history.txt")
+    if os.path.isfile(hist):
+        out["commands"] += scan_ps_history(hist)
+    for log in ("Microsoft-Windows-PowerShell/Operational", "Windows PowerShell"):
+        try:
+            out["commands"] += commands_from_events(read_events(log=log, match=BITS_CMD_RE.pattern))
+        except Exception as e:
+            out["notes"].append("%s: %s" % (log, e))
+    try:
+        out["do_downloads"] = delivery_optimization()
+    except Exception as e:
+        out["notes"].append("Delivery Optimization: %s" % e)
+    return out
 
 
 def live_jobs(raw_json=None):
@@ -837,28 +988,217 @@ def live_jobs(raw_json=None):
     return jobs
 
 
+# ---------------------------------------------------------------- extra artifacts
+BITS_CMD_RE = re.compile(r"\bbitsadmin(\.exe)?\b|\b(Start|Get|Set|Add|Complete|Remove|Suspend|Resume)"
+                         r"-BitsTransfer\b|BackgroundCopyManager|IBackgroundCopy|"
+                         r"Import-Module\s+BitsTransfer|SetNotifyCmdLine", re.I)
+
+
+def command_level(text):
+    t = text or ""
+    if re.search(r"SetNotifyCmdLine|/SetNotifyCmdLine|NotifyCmdLine", t, re.I):
+        return "HIGH"
+    urls = re.findall(r"[a-z][a-z0-9+.-]*://[^\s'\"<>]+", t, re.I)
+    if any(url_host(u).startswith("127.") or url_host(u) == "localhost" for u in urls):
+        return "HIGH"
+    if re.search(r"/upload\b|TransferType\s+Upload|/transfer\b|/create\b|/addfile\b|Start-BitsTransfer", t, re.I) \
+            and not (urls and all(benign_host(u) for u in urls)):
+        return "MED"
+    return "INFO"
+
+
+def _cmd(source, text, time=None, kind="", extra=None):
+    m = BITS_CMD_RE.search(text or "")
+    s = max(0, (m.start() if m else 0) - 150)
+    snippet = (text or "")[s:s + 500].replace("\r", " ").replace("\n", " ⏎ ")
+    d = {"time": time, "kind": kind, "source": source, "text": snippet, "level": command_level(text)}
+    d.update(extra or {})
+    return d
+
+
+def scan_ps_history(path):
+    """PSReadLine ConsoleHost_history.txt -> BITS-related command lines (no timestamps exist)."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh, 1):
+                if BITS_CMD_RE.search(line):
+                    out.append(_cmd("%s:%d" % (path, n), line.strip(), None, "PSReadLine history",
+                                    {"line_no": n}))
+    except OSError:
+        pass
+    return out
+
+
+def commands_from_events(events):
+    """PowerShell 4103/4104 (or any non-BITS channel) events that mention BITS."""
+    out = []
+    for e in events:
+        txt = e.get("script") or e.get("message") or ""
+        if BITS_CMD_RE.search(txt):
+            out.append(_cmd(e.get("source"), txt, e.get("time"), "%s %s" % (
+                (e.get("channel") or "").split("/")[0].replace("Microsoft-Windows-", ""), e["event_id"]),
+                {"record": e.get("record")}))
+    return out
+
+
+DO_PS = r"""
+$ErrorActionPreference='Stop'
+@(Get-DeliveryOptimizationStatus | ForEach-Object { [pscustomobject]@{
+  file_id=$_.FileId; source_url=$_.SourceURL; size=$_.FileSize; downloaded=$_.TotalBytesDownloaded
+  status=[string]$_.Status; priority=[string]$_.Priority; mode=[string]$_.DownloadMode
+  from_http=$_.BytesFromHttp; from_peers=$_.BytesFromPeers; cache_host=$_.CacheHost
+  caller=$_.PredefinedCallerApplication; expires=$(if($_.ExpireOn){$_.ExpireOn.ToUniversalTime().ToString('o')})
+  duration=[string]$_.DownloadDuration } }) | ConvertTo-Json -Depth 3 -Compress
+"""
+
+
+def delivery_optimization(raw_json=None):
+    """Live Delivery Optimization cache (non-BITS Windows Update/Store/Office/Edge downloads)."""
+    txt = raw_json if raw_json is not None else _ps(DO_PS, timeout=90)
+    if not txt:
+        return []
+    data = json.loads(txt)
+    if isinstance(data, dict):
+        data = [data]
+    for d in data:
+        h = url_host(d.get("source_url") or "")
+        d["host"] = h
+        d["level"] = "INFO" if (benign_host(d.get("source_url")) or not h) else "MED"
+        d["triage"] = [] if d["level"] == "INFO" else ["MED: Delivery Optimization source not allowlisted: " + h]
+    return data
+
+
+def _map_path(p, root):
+    if not p or is_url(p) or "%" in p:
+        return None
+    if root is None:
+        return p
+    m = re.match(r"^[A-Za-z]:\\(.*)$", p)
+    if not m:
+        return None
+    base = os.path.realpath(root)
+    q = os.path.realpath(os.path.join(base, *[x for x in m.group(1).split("\\") if x]))
+    # attacker-controlled paths must not escape the mounted image (e.g. C:\..\..\x)
+    return q if os.path.commonpath([base, q]) == base else None
+
+
+def check_files(jobs, root=None, hash_limit=256 << 20):
+    """Does each job's local file exist (live disk, or a mounted image at `root`)? Size, times, SHA-256."""
+    for j in jobs:
+        for f in j.get("files") or []:
+            remote, local = _remote_local(f)
+            for key, p in (("local_check", local), ("tmp_check", f.get("tmp_file"))):
+                q = _map_path(p, root)
+                if not q:
+                    continue
+                res = {"path": q, "exists": os.path.isfile(q)}
+                if res["exists"]:
+                    st = os.stat(q)
+                    res.update(size=st.st_size, modified=dt.datetime.fromtimestamp(
+                        st.st_mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    if st.st_size <= hash_limit:
+                        try:
+                            res["sha256"] = sha256(q)
+                        except OSError as e:
+                            res["error"] = str(e)
+                f[key] = res
+        retriage(j)
+    return jobs
+
+
+MFT_COLS = {"ParentPath", "FileName", "InUse"}
+
+
+def is_mftecmd_csv(path):
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            return MFT_COLS <= set(next(csv.reader(fh), []))
+    except OSError:
+        return False
+
+
+def correlate_mft(jobs, csv_path, drive="C:"):
+    """MFTECmd $MFT CSV -> did each job's local/tmp file land, get deleted, or never exist?"""
+    want = {}
+    for j in jobs:
+        for f in j.get("files") or []:
+            for p in (_remote_local(f)[1], f.get("tmp_file")):
+                if p and re.match(r"^[A-Za-z]:\\", p) and p[:2].upper() == drive.upper():
+                    want.setdefault(p.lower(), []).append(f)
+    if not want:
+        return 0
+    hits = 0
+    with open(csv_path, encoding="utf-8-sig", errors="replace", newline="") as fh:
+        for row in csv.DictReader(fh):
+            par = (row.get("ParentPath") or "").lstrip(".")
+            full = (drive + par.rstrip("\\") + "\\" + (row.get("FileName") or "")).lower()
+            for f in want.get(full, []):
+                ent = {"in_use": (row.get("InUse") or "").lower() == "true",
+                       "entry": row.get("EntryNumber"), "size": row.get("FileSize"),
+                       "created": row.get("Created0x10"), "modified": row.get("LastModified0x10"),
+                       "fn_created": row.get("Created0x30"), "source": os.path.basename(csv_path)}
+                f.setdefault("mft", []).append(ent)
+                hits += 1
+    for j in jobs:
+        retriage(j)
+    return hits
+
+
+def file_status_flags(files):
+    flags = []
+    for f in files:
+        local = _remote_local(f)[1]
+        lc = f.get("local_check") or {}
+        if lc.get("exists") and re.search(r"\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr|msi|sys)$", local, re.I) \
+                and not benign_host(_remote_local(f)[0]):
+            flags.append("HIGH: BITS-written executable still on disk: %s sha256=%s"
+                         % (lc["path"], lc.get("sha256", "?")))
+        for m in f.get("mft") or []:
+            flags.append("INFO: $MFT entry %s for %s (%s, created %s)" % (
+                m["entry"], local, "in use" if m["in_use"] else "DELETED", m["created"]))
+    return flags
+
+
 # ---------------------------------------------------------------- main
-def main():
+def main(argv=None):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
         pass
-    ap = argparse.ArgumentParser(description="BITS qmgr.db parser + carver")
-    ap.add_argument("-i", "--input", required=True, help="folder with qmgr.db, edb*.log, ...")
+    ap = argparse.ArgumentParser(description="BITS qmgr.db parser + carver (v%s)" % __version__)
+    ap.add_argument("-i", "--input", required=True,
+                    help="collection folder: qmgr.db, edb*.log, $I30, *.evtx, ConsoleHost_history.txt, "
+                         "MFTECmd CSV (searched recursively)")
     ap.add_argument("-o", "--output", required=True, help="output folder")
-    ap.add_argument("--no-carve", action="store_true")
+    ap.add_argument("--no-carve", action="store_true", help="ESE tables only")
     ap.add_argument("--live-events", action="store_true",
                     help="also correlate THIS machine's BITS-Client/Operational log "
                          "(only if the evidence came from this machine)")
-    a = ap.parse_args()
+    ap.add_argument("--live-extras", action="store_true",
+                    help="also collect THIS machine's PowerShell history/script blocks mentioning BITS "
+                         "and the Delivery Optimization cache")
+    ap.add_argument("--mount-root", help="mounted image root (e.g. E:\\) to check/hash each job's local file")
+    ap.add_argument("--mft-drive", default="C:", help="drive letter the MFTECmd CSV belongs to (default C:)")
+    ap.add_argument("--version", action="version", version=__version__)
+    a = ap.parse_args(argv)
+    if not os.path.isdir(a.input):
+        ap.error("input folder not found: %s" % a.input)
     extra = read_events() if a.live_events else None
-    result = analyse(a.input, a.no_carve, events=extra)
+    result = analyse(a.input, a.no_carve, events=extra, mount_root=a.mount_root, mft_drive=a.mft_drive)
+    if a.live_extras:
+        x = live_extras()
+        result["commands"] += x["commands"]; result["do_downloads"] = x["do_downloads"]
+        result["parse_notes"] += x["notes"]; result["summary"]["commands"] = len(result["commands"])
     write_outputs(result, a.output)
     s = result["summary"]
-    print("[+] %d job records -> %d unique jobs (%d active, %d recovered-only, %d event-log-only); "
-          "%d file records; %d events; %d $I30 entries"
-          % (s["job_records"], s["unique_jobs"], s["active_jobs"], s["recovered_only_jobs"],
-             s["event_only_jobs"], s["file_records"], s["events"], s["i30_entries"]))
+    print("[+] v%s: %d job records -> %d unique jobs (%d active, %d recovered-only, %d event-log-only); "
+          "%d file records; %d events; %d BITS commands; %d $I30 entries"
+          % (__version__, s["job_records"], s["unique_jobs"], s["active_jobs"], s["recovered_only_jobs"],
+             s["event_only_jobs"], s["file_records"], s["events"], s["commands"], s["i30_entries"]))
+    for c in result["commands"]:
+        if c["level"] != "INFO":
+            print("  [cmd %s] %s  %s" % (c["level"], c["kind"], c["text"][:140]))
     shown = 0
     for j in result["latest"]:
         top = [t for t in j["triage"] if not t.startswith("INFO")]

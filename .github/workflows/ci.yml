@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows / Python ${{ matrix.python }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install (package + extras)
+        run: python -m pip install -e ".[screenshot,dev]"
+      - name: Lint
+        run: python -m pyflakes bits_qmgr_parser.py bits_gui.py bits_synth.py make_demo_data.py test_bits_qmgr_parser.py
+      - name: Tests
+        run: python -m unittest -v test_bits_qmgr_parser
+      - name: CLI smoke test on synthetic data
+        run: |
+          python make_demo_data.py demo_evidence
+          bits-qmgr -i demo_evidence -o out
+          bits-qmgr --version
+
+  pinned:
+    name: Windows / pinned requirements.txt
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt pyflakes
+      - run: python -m unittest test_bits_qmgr_parser
+
+  linux-core:
+    name: Linux / core parser (no GUI, no PowerShell)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m unittest -v test_bits_qmgr_parser
+
+  package:
+    name: Build wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build
+      - run: python -m build
+      - run: python -m pip install dist/*.whl && bits-qmgr --version

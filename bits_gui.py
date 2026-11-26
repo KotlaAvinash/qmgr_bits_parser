@@ -48,6 +48,10 @@ FILE_COLS = [("source_url", 420), ("dest_file", 360), ("download_size", 95), ("t
 EVT_COLS = [("time", 165), ("event_id", 70), ("what", 150), ("job_name", 220), ("job_id", 270),
             ("url", 330), ("local", 280), ("process", 260), ("program_args", 300), ("hr", 95),
             ("owner", 170), ("source", 120)]
+CMD_COLS = [("level", 70), ("time", 160), ("kind", 170), ("text", 700), ("source", 330)]
+DO_COLS = [("level", 70), ("status", 90), ("caller", 210), ("host", 260), ("size", 110),
+           ("downloaded", 110), ("from_http", 100), ("from_peers", 95), ("mode", 80), ("expires", 160),
+           ("source_url", 500)]
 I30_COLS = [("name", 180), ("logical_size", 100), ("created", 170), ("modified", 170),
             ("mft_modified", 170), ("accessed", 170), ("in_slack", 70), ("source", 120)]
 UTC_COLS = {"created", "modified", "mft_modified", "accessed", "remote_last_modified", "time"}
@@ -78,12 +82,14 @@ def save_prefs(p):
 class App(tk.Tk):
     def __init__(self, folder=None, theme=None):
         super().__init__()
-        self.title("BITS QMGR Analyzer")
+        self.title("BITS QMGR Analyzer v%s" % P.__version__)
         self.geometry("1500x900")
         self.minsize(1000, 600)
         self.prefs = load_prefs()
         self.theme = theme or self.prefs.get("theme", "light")
         self.result, self.live, self.live_events = None, [], []
+        self.extras = {"commands": [], "do_downloads": [], "notes": []}
+        self.cmdrows, self.dorows = {}, {}
         self.rows, self.evrows = {}, {}
         self.q = queue.Queue()
         self._search_job = None
@@ -151,7 +157,7 @@ class App(tk.Tk):
         st.configure("TScrollbar", background=t["head"], troughcolor=t["bg"], arrowcolor=t["fg"],
                      bordercolor=t["border"])
         st.configure("Horizontal.TProgressbar", background=t["accent"], troughcolor=t["panel"])
-        for tv in (self.jobs_tv, self.ev_tv):
+        for tv in (self.jobs_tv, self.ev_tv, self.cmd_tv, self.do_tv):
             for lv, (bg, fg) in t["lv"].items():
                 tv.tag_configure(lv or "none", background=bg, foreground=fg)
         for w in (self.detail, self.ev_txt):
@@ -197,7 +203,8 @@ class App(tk.Tk):
                            ("recovered_only_jobs", "Recovered (deleted)"),
                            ("event_only_jobs", "Event-log only"), ("events", "Events"),
                            ("file_records", "File records"), ("HIGH", "HIGH"), ("MED", "MED"),
-                           ("REVIEW", "REVIEW"), ("live", "Live jobs")):
+                           ("REVIEW", "REVIEW"), ("live", "Live jobs"),
+                           ("commands", "BITS commands"), ("do", "Deliv. Opt.")):
             f = ttk.Frame(self.cards, style="Card.TFrame", padding=(10, 4))
             f.pack(side="left", padx=(0, 6), pady=6)
             v = tk.StringVar(value="–"); self.card_vars[key] = v
@@ -231,12 +238,16 @@ class App(tk.Tk):
         self.jobs_tv = self._tree(self.nb, JOB_COLS, "Jobs")
         self.files_tv = self._tree(self.nb, FILE_COLS, "Files")
         self.ev_tv = self._tree(self.nb, EVT_COLS, "Events")
+        self.cmd_tv = self._tree(self.nb, CMD_COLS, "Commands")
+        self.do_tv = self._tree(self.nb, DO_COLS, "Delivery Opt.")
         self.i30_tv = self._tree(self.nb, I30_COLS, "$I30")
         ev = ttk.Frame(self.nb); self.nb.add(ev, text="Evidence & notes")
         self.ev_txt = tk.Text(ev, font=("Consolas", 9), wrap="none", relief="flat")
         self.ev_txt.pack(fill="both", expand=True)
         self.jobs_tv.bind("<<TreeviewSelect>>", self._show_detail)
         self.ev_tv.bind("<<TreeviewSelect>>", self._show_event)
+        self.cmd_tv.bind("<<TreeviewSelect>>", lambda e: self._show_row(self.cmd_tv, self.cmdrows))
+        self.do_tv.bind("<<TreeviewSelect>>", lambda e: self._show_row(self.do_tv, self.dorows))
 
         det = ttk.LabelFrame(pw, text="Details", padding=4); pw.add(det, weight=2)
         self.detail = tk.Text(det, font=("Consolas", 9), wrap="word", relief="flat", height=12)
@@ -297,11 +308,12 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def load_live(self):
-        self._busy("Querying Get-BitsTransfer + BITS-Client event log …")
+        self._busy("Querying Get-BitsTransfer, event logs, PowerShell history, Delivery Optimization …")
 
         def work():
             try:
-                self.q.put(("live", P.live_snapshot()))
+                jobs, events = P.live_snapshot()
+                self.q.put(("live", (jobs, events, P.live_extras())))
             except Exception as e:
                 self.q.put(("error", "%s: %s" % (type(e).__name__, e)))
         threading.Thread(target=work, daemon=True).start()
@@ -316,7 +328,8 @@ class App(tk.Tk):
             P.write_outputs(self.result, d)
         if self.live:
             with open(os.path.join(d, "bits_live_snapshot.json"), "w", encoding="utf-8") as fh:
-                json.dump({"jobs": self.live, "events": self.live_events}, fh, indent=2, default=str)
+                json.dump({"version": P.__version__, "jobs": self.live, "events": self.live_events,
+                           "extras": self.extras}, fh, indent=2, default=str)
         self.status.set("Exported to " + d)
 
     def _busy(self, msg):
@@ -335,11 +348,15 @@ class App(tk.Tk):
                                     % (val["input"], s["job_records"], s["unique_jobs"], s["events"],
                                        s["file_records"]))
                 elif kind == "live":
-                    self.live, self.live_events = val; self.prog.stop()
-                    self._fill_events(); self.refresh()
-                    self.status.set("Live snapshot: %d jobs (%d from Get-BitsTransfer), %d events"
+                    self.live, self.live_events, self.extras = val; self.prog.stop()
+                    self._fill_events(); self._fill_extras(); self.refresh()
+                    notes = "; ".join(self.extras.get("notes") or [])
+                    self.status.set("Live snapshot: %d jobs (%d from Get-BitsTransfer), %d events, "
+                                    "%d BITS commands, %d Delivery Optimization downloads%s"
                                     % (len(self.live), len([j for j in self.live if j["status"] == "live"]),
-                                       len(self.live_events)))
+                                       len(self.live_events), len(self.extras["commands"]),
+                                       len(self.extras["do_downloads"]),
+                                       ("  [" + notes + "]") if notes else ""))
                 elif kind == "error":
                     self.prog.stop(); self.status.set("Error: " + val)
                     messagebox.showerror("BITS", val)
@@ -400,6 +417,9 @@ class App(tk.Tk):
             self.card_vars[k].set(str(v))
         self.card_vars["live"].set(str(len([j for j in self.live if j["status"] == "live"]))
                                    if self.live else "–")
+        n_cmd = len(self.extras["commands"]) + len((self.result or {}).get("commands") or [])
+        self.card_vars["commands"].set(str(n_cmd) if (self.result or self.live) else "–")
+        self.card_vars["do"].set(str(len(self.extras["do_downloads"])) if self.live else "–")
         kids = tv.get_children()
         if kids:
             tv.selection_set(kids[0])
@@ -435,7 +455,7 @@ class App(tk.Tk):
             self.i30_tv.insert("", "end", values=(e["name"], e["logical_size"], short(e["created"]),
                                                   short(e["modified"]), short(e["mft_modified"]),
                                                   short(e["accessed"]), e["in_slack"], e["source"]))
-        self._fill_events()
+        self._fill_events(); self._fill_extras()
         t = self.ev_txt; t.delete("1.0", "end")
         t.insert("end", "Input: %s\nRun (UTC): %s\n\nInventory (SHA-256)\n" % (r["input"], r["run_utc"]))
         for i in r["inventory"]:
@@ -462,16 +482,19 @@ class App(tk.Tk):
                 "owner_sid", "owner", "created", "modified", "transfer_completed", "completed",
                 "expiration", "notify_cmd", "notify_args", "notify_cmd_evt", "notify_args_evt",
                 "notify_flags", "retry_delay_s", "no_progress_timeout_s", "creator_process_inferred",
-                "creator_process_evt", "creator_aumid_inferred", "http_method", "errors", "source"]
+                "creator_process_evt", "creator_aumid_inferred", "http_method", "errors",
+                "sd_owner_sid", "sd_group_sid", "sd_sddl", "sd_dacl", "source"]
         for k in keys:
             if k in j and j[k] not in (None, "", []):
                 t.insert("end", "%-26s" % k, ("key",)); t.insert("end", "%s\n" % (j[k],))
         for n, f in enumerate(j.get("files") or []):
             t.insert("end", "\nfile[%d]\n" % n, ("key",))
             for k in ("source_url", "dest_file", "tmp_file", "download_size", "transfer_size",
-                      "complete", "remote_last_modified_inferred", "from"):
+                      "complete", "remote_last_modified_inferred", "from", "local_check", "tmp_check"):
                 if f.get(k) not in (None, ""):
                     t.insert("end", "  %-24s%s\n" % (k, f[k]))
+            for m in f.get("mft") or []:
+                t.insert("end", "  %-24s%s\n" % ("$MFT", m))
         if j.get("events"):
             t.insert("end", "\nevent timeline (%d)\n" % len(j["events"]), ("key",))
             for e in j["events"]:
@@ -480,6 +503,31 @@ class App(tk.Tk):
                 t.insert("end", "  %s  %-5s %-20s %s %s\n" % (short(e["time"]), e["event_id"], e["what"],
                                                              extra, e.get("hr") or ""),
                          (EVENT_LV.get(e["event_id"], "muted"),))
+
+    def _fill_extras(self):
+        cmds = list(self.extras["commands"]) + list((self.result or {}).get("commands") or [])
+        order = {lv: n for n, lv in enumerate(P.LEVELS)}
+        for tv, rows, data, cols in ((self.cmd_tv, self.cmdrows, cmds, CMD_COLS),
+                                     (self.do_tv, self.dorows, self.extras["do_downloads"], DO_COLS)):
+            tv.delete(*tv.get_children()); rows.clear()
+            for i, d in enumerate(sorted(data, key=lambda d: order.get(d.get("level"), 9))):
+                iid = "x%d" % i
+                vals = [short(d.get(c)) if c in ("time", "expires") else d.get(c) for c, _ in cols]
+                tv.insert("", "end", iid=iid, values=vals, tags=(d.get("level") or "none",))
+                rows[iid] = d
+
+    def _show_row(self, tv, rows):
+        sel = tv.selection()
+        d = rows.get(sel[0]) if sel else None
+        if not d:
+            return
+        t = self.detail
+        t.delete("1.0", "end")
+        for fl in d.get("triage") or []:
+            t.insert("end", "• " + fl + "\n", (fl.split(":")[0],))
+        for k, v in d.items():
+            if v not in (None, "", []) and k != "triage":
+                t.insert("end", "%-20s" % k, ("key",)); t.insert("end", "%s\n" % (v,))
 
     def _show_event(self, _e=None):
         sel = self.ev_tv.selection()

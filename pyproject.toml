@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmgr-bits-parser"
+dynamic = ["version"]
+description = "Offline forensic parser, carver and GUI for the Windows BITS queue (qmgr.db)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Kotla Avinash" }]
+keywords = ["dfir", "forensics", "bits", "qmgr", "windows", "persistence", "incident-response"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Intended Audience :: Information Technology",
+]
+dependencies = [
+    "dissect.esedb>=3.18,<4",
+]
+
+[project.optional-dependencies]
+screenshot = ["pillow>=10"]
+dev = ["pyflakes>=3"]
+
+[project.scripts]
+bits-qmgr = "bits_qmgr_parser:main"
+
+[project.gui-scripts]
+bits-qmgr-gui = "bits_gui:main"
+
+[project.urls]
+Homepage = "https://github.com/KotlaAvinash/qmgr_bits_parser"
+Issues = "https://github.com/KotlaAvinash/qmgr_bits_parser/issues"
+
+[tool.setuptools]
+py-modules = ["bits_qmgr_parser", "bits_gui", "bits_synth"]
+
+[tool.setuptools.dynamic]
+version = { attr = "bits_qmgr_parser.__version__" }

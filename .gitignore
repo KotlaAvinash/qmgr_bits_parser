@@ -1,0 +1,22 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+
+# outputs and evidence - never commit real case data
+out/
+exp/
+demo_evidence/
+testjob/
+*.db
+*.log
+*.jrs
+*.jfm
+*.chk
+*.evtx
+*.FileSlack
+$I30
+local_expectations.json
+
+# ad-hoc screenshots (curated ones live in docs/)
+/*.png

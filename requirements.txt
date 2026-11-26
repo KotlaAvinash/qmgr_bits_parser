@@ -1,0 +1,2 @@
+dissect.esedb>=3.18   # Apache-2.0 - ESE (qmgr.db) reader; carving works without it
+pillow>=10.0          # MIT-CMU   - only for bits_gui.py --screenshot

@@ -1,6 +1,6 @@
 # qmgr_bits_parser
 
-[![CI](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml/badge.svg)](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml) ![version](https://img.shields.io/badge/version-1.2.1-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+[![CI](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml/badge.svg)](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml) ![version](https://img.shields.io/badge/version-1.3.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 Offline forensic parser, carver and GUI for the **Windows BITS queue** (`qmgr.db`). It recovers active **and deleted** BITS jobs and correlates them with:
 - the BITS event log
@@ -32,6 +32,7 @@ Completed and cancelled jobs are deleted from the queue, but their records often
 | **Delivery Optimization** | Live DO cache: Windows Update, Store and Office downloads that **bypass BITS**, with the calling application |
 | **Payload check** | On the live disk or a `--mount-root` image: does each job's local file still exist? Size, mtime and SHA-256 |
 | **`$MFT`** | A raw `$MFT` (native parser, no extra dependency) or an MFTECmd CSV in the folder: each local/temp file's MFT entry, whether it is in use or **deleted**, size and `$SI`/`$FN` times. Hard links, extension records and fix-ups are handled |
+| **Collection check** | Tells you whether all artifacts were captured at the same moment: compares each one's time window, the newest record inside `qmgr.db` against the `$MFT`, and which queue logs exist on disk but were not collected |
 | **Live snapshot** | `Get-BitsTransfer`, the event logs, PowerShell history and the DO cache, no admin needed |
 | **Triage** | HIGH / MED / REVIEW / INFO, with an exact-domain allowlist for known updaters |
 | **GUI** | Tkinter: Jobs / Files / Events / Commands / Delivery Opt. / `$I30` / Evidence tabs, filters, an event timeline per job, light/dark theme, export |
@@ -140,7 +141,7 @@ These were verified on a real Windows 11 host: a known test job's notify command
 ```powershell
 .\.venv\Scripts\python -m unittest -v test_bits_qmgr_parser
 ```
-78 tests. CI runs them on Windows with Python 3.10–3.13, again with the pinned requirements, on Linux (core parser only), and checks that the wheel builds. They cover:
+81 tests. CI runs them on Windows with Python 3.10–3.13, again with the pinned requirements, on Linux (core parser only), and checks that the wheel builds. They cover:
 - unit, triage and allowlist-bypass checks
 - fuzzing and truncation
 - full pipeline and command line

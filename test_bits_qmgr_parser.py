@@ -735,6 +735,53 @@ class TestRawMft(unittest.TestCase):
             self.assertEqual(P.correlate_raw_mft([j], p)[0], 0)
 
 
+class TestCollectionCheck(unittest.TestCase):
+    DL = "C:\\ProgramData\\Microsoft\\Network\\Downloader"
+
+    def _kid(self, name, modified, in_use=True):
+        return {"name": name, "entry": 1, "in_use": in_use, "is_dir": False, "size": 1,
+                "modified": modified, "mft_changed": modified, "created": modified}
+
+    def test_consistent(self):
+        inv = [{"file": "qmgr.db", "mtime": "2026-11-26T10:00:00Z"}, {"file": "edb.log", "mtime": "2026-11-26T10:00:00Z"}]
+        jobs = [{"status": "active", "modified": "2026-11-26T09:59:00Z"}]
+        dirs = {7: {"path": self.DL, "entries": [self._kid("qmgr.db", "2026-11-26T10:00:00Z"),
+                                                   self._kid("edb.log", "2026-11-26T10:00:01Z")]}}
+        c = P.collection_check(inv, jobs, [{"time": "2026-11-26T09:58:00Z"}], [], dirs)
+        self.assertEqual(c["verdict"], "consistent", c["findings"])
+
+    def test_mixed(self):
+        inv = [{"file": "qmgr.db", "mtime": "2026-11-26T10:00:00Z"}, {"file": "edb00089.log", "mtime": "2026-11-20T00:00:00Z"}]
+        jobs = [{"status": "active", "modified": "2026-11-26T09:59:00Z"},
+                {"status": "event log only", "modified": "2026-11-26T20:00:00Z"}]
+        dirs = {7: {"path": self.DL, "entries": [self._kid("qmgr.db", "2026-11-26T18:48:00Z"),
+                                                   self._kid("edb0008B.log", "2026-11-26T19:57:00Z")]}}
+        i30 = [{"name": "qmgr.db", "parent_ref": 7, "in_slack": False, "source": "$I30@0x0",
+                "created": None, "modified": "2026-11-26T10:00:00Z", "mft_modified": None},
+               {"name": "edb00089.log", "parent_ref": 7, "in_slack": False, "source": "$I30@0x1",
+                "created": None, "modified": "2026-11-20T00:00:00Z", "mft_modified": None}]
+        c = P.collection_check(inv, jobs, [{"time": "2026-11-26T20:41:00Z"}], i30, dirs)
+        txt = " ".join(f["text"] for f in c["findings"])
+        self.assertEqual(c["verdict"], "MIXED collection times")
+        for needle in ("after the newest database record", "Content check", "edb0008B.log exists in the $MFT",
+                       "edb00089.log was collected but is absent", "equals its $I30 index entry",
+                       "only in $I30: ['edb00089.log']"):
+            self.assertIn(needle, txt)
+
+    def test_analyse_resolves_i30_dirs_with_raw_mft(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_folder(d, nested=False)                 # $I30 entries have parent_ref 5 (root)
+            img, _ = synthetic_mft()
+            with open(os.path.join(d, "$MFT"), "wb") as fh:
+                fh.write(img)
+            r = P.analyse(d)
+        self.assertTrue(all(e["dir_path"] == "C:\\" for e in r["i30"]))
+        self.assertEqual(r["mft_dirs"][5]["path"], "C:\\")
+        self.assertEqual({k["name"] for k in r["mft_dirs"][5]["entries"]}, {"Windows", "Users"})
+        self.assertIn(r["collection"]["verdict"], ("consistent", "MIXED collection times"))
+        self.assertTrue(all("mtime" in i for i in r["inventory"]))
+
+
 class TestDemoData(unittest.TestCase):
     def test_demo_folder_levels_and_links(self):
         import make_demo_data
@@ -823,6 +870,10 @@ class TestRealEvidence(unittest.TestCase):
         if "i30_names" in EXPECT:               # Downloader index entries must be present
             missing = set(EXPECT["i30_names"]) - {e["name"] for e in self.r["i30"]}
             self.assertEqual(missing, set())
+        if "collection_verdict" in EXPECT:
+            self.assertEqual(self.r["collection"]["verdict"], EXPECT["collection_verdict"])
+        for needle in EXPECT.get("collection_findings", []):
+            self.assertTrue(any(needle in f["text"] for f in self.r["collection"]["findings"]), needle)
 
 
 def _live_events_available():

@@ -53,7 +53,7 @@ DO_COLS = [("level", 70), ("status", 90), ("caller", 210), ("host", 260), ("size
            ("downloaded", 110), ("from_http", 100), ("from_peers", 95), ("mode", 80), ("expires", 160),
            ("source_url", 500)]
 I30_COLS = [("name", 180), ("logical_size", 100), ("created", 170), ("modified", 170),
-            ("mft_modified", 170), ("accessed", 170), ("in_slack", 70), ("source", 120)]
+            ("mft_modified", 170), ("accessed", 170), ("in_slack", 70), ("dir_path", 330), ("source", 160)]
 UTC_COLS = {"created", "modified", "mft_modified", "accessed", "remote_last_modified", "time"}
 STATUSES = ["All", "live", "active", "historic_version_of_active", "deleted/recovered",
             "event log only", "event log only (live)"]
@@ -454,12 +454,29 @@ class App(tk.Tk):
         for e in r["i30"]:
             self.i30_tv.insert("", "end", values=(e["name"], e["logical_size"], short(e["created"]),
                                                   short(e["modified"]), short(e["mft_modified"]),
-                                                  short(e["accessed"]), e["in_slack"], e["source"]))
+                                                  short(e["accessed"]), e["in_slack"], e.get("dir_path") or e["parent_ref"],
+                                                  e["source"]))
         self._fill_events(); self._fill_extras()
         t = self.ev_txt; t.delete("1.0", "end")
-        t.insert("end", "Input: %s\nRun (UTC): %s\n\nInventory (SHA-256)\n" % (r["input"], r["run_utc"]))
+        t.insert("end", "Input: %s\nRun (UTC): %s\n\n" % (r["input"], r["run_utc"]))
+        c = r.get("collection") or {}
+        if c:
+            t.insert("end", "COLLECTION CHECK: %s\n" % c["verdict"])
+            for w in c["windows"]:
+                t.insert("end", "  %-58s %s -> %s\n" % (w["artifact"][:58], w["from"], w["to"]))
+            for f in c["findings"]:
+                t.insert("end", "  [%s] %s\n" % (f["level"], f["text"]))
+            t.insert("end", "\n")
+        for d, info in (r.get("mft_dirs") or {}).items():
+            t.insert("end", "$MFT entries in %s (entry %s)\n" % (info["path"], d))
+            for k in info["entries"]:
+                t.insert("end", "  %-34s %-8s %-8s %12s  created %s  modified %s\n" % (
+                    k["name"][:34], k["entry"], "in use" if k["in_use"] else "DELETED", k["size"],
+                    (k["created"] or "")[:19], (k["modified"] or "")[:19]))
+            t.insert("end", "\n")
+        t.insert("end", "Inventory (SHA-256, copied-file mtime)\n")
         for i in r["inventory"]:
-            t.insert("end", "  %-40s %10d  %s\n" % (i["file"], i["size"], i["sha256"]))
+            t.insert("end", "  %-40s %12d  %s  %s\n" % (i["file"], i["size"], i.get("mtime", ""), i["sha256"]))
         t.insert("end", "\nFileSlack URLs (earlier disk content — NOT BITS records)\n")
         for k, v in r["fileslack_urls"].items():
             t.insert("end", "  [%s]\n" % k)

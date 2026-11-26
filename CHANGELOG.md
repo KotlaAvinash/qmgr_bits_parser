@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0 - 2026-11-27
+### Added
+- **Collection-consistency check** (`collection` in the JSON report, printed by the CLI, shown in the GUI's Evidence tab). It answers: were all artifacts captured at the same moment?
+  - **Time windows:** the period each artifact covers (database records, copied-file mtimes, BITS event log, each `$I30`, and the `$MFT` view of each indexed folder).
+  - **Content check:** the newest record *inside* `qmgr.db`/logs is compared with the `qmgr.db` write time in the `$MFT`. This works independently of copy-tool timestamps.
+  - **File-level comparison:** the Downloader folder in the `$MFT` is compared with the copied files. It reports logs that exist but were not collected, collected logs that were rotated away later, and later writes. When a copy's mtime equals its `$I30` entry it adds a caveat, because NTFS updates index times lazily and some copy tools use them.
+  - **`$I30` against `$MFT`:** reports where the index and the `$MFT` disagree.
+- `$I30` entries now record their **source file** and, when a raw `$MFT` is present, the **real folder path** of their parent (for example `$I30` → `C:\ProgramData\Microsoft\Network\Downloader`, `$I30.copy0` → `C:\`). The GUI `$I30` tab has a `dir_path` column.
+- The same single `$MFT` pass also lists **every entry, live or deleted, in each folder an `$I30` describes** (`mft_dirs`).
+- The inventory records each copied file's mtime.
+
+### Fixed
+- A root directory no longer lists itself (its `.` entry) as a child.
+
 ## 1.2.1 - 2026-11-27
 ### Fixed
 - The `v1.2.0` commit was missing pieces because a working-copy file was reverted while it was being committed. Missing were the raw-`$MFT` test class, the live-disk ground-truth test, and the "record size from the first valid FILE record" fix. CI flagged it as unused imports. All three are restored here, with no other code change.

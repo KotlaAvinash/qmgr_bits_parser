@@ -15,7 +15,7 @@ constants; verified byte-by-byte against a real Windows 11 queue.
 """
 import argparse, csv, datetime as dt, hashlib, json, ntpath, os, re, struct, sys, uuid
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 JOB_DELIMS = [bytes.fromhex(h) for h in (
     "a15609e143afc94292e66f9856eba7f6", "9f95d44c6470f24b84d7476a7e62699f",
@@ -451,7 +451,7 @@ def parse_i30(path):
                             "modified": filetime(times[1]), "mft_modified": filetime(times[2]),
                             "accessed": filetime(times[3]),
                             "in_slack": o >= live_end,
-                            "source": "$I30@0x%x" % (blk + o)})
+                            "source": "%s@0x%x" % (os.path.basename(path), blk + o)})
             except (struct.error, UnicodeDecodeError):
                 continue
     seen, res = set(), []
@@ -627,7 +627,9 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
         fn = os.path.basename(p)
         low = fn.lower()
         say("hashing " + rel)
-        inventory.append({"file": rel, "size": os.path.getsize(p), "sha256": sha256(p)})
+        st = os.stat(p)
+        inventory.append({"file": rel, "size": st.st_size, "sha256": sha256(p),
+                          "mtime": dt.datetime.fromtimestamp(st.st_mtime, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
         if low == "qmgr.db":
             say("reading ESE tables in " + rel)
             j, f, n = read_ese(p)
@@ -699,12 +701,18 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
             notes.append("$MFT CSV %s: %d matches" % (os.path.basename(c), correlate_mft(jobs, c, mft_drive)))
         except Exception as e:
             notes.append("$MFT CSV %s: %s" % (os.path.basename(c), e))
+    mft_dirs = {}
     for m in raw_mfts:
         say("scanning raw $MFT %s (one pass)" % os.path.basename(m))
         try:
-            n, stats = correlate_raw_mft(jobs, m, mft_drive)
+            n, stats = correlate_raw_mft(jobs, m, mft_drive, dirs={e["parent_ref"] for e in i30})
             notes.append("raw $MFT %s: %d records scanned, %d matches"
                          % (os.path.basename(m), stats["records"], n))
+            for d, path in stats["dir_paths"].items():
+                mft_dirs[d] = {"path": path, "entries": sorted(stats["children"].get(d, []),
+                                                              key=lambda k: k["name"].lower())}
+            for e in i30:
+                e["dir_path"] = stats["dir_paths"].get(e["parent_ref"])
         except Exception as e:
             notes.append("raw $MFT %s: %s: %s" % (os.path.basename(m), type(e).__name__, e))
     for j in jobs:
@@ -727,8 +735,107 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
                                              if j["level"] in ("HIGH", "MED", "REVIEW")}),
                         "commands": len(commands)},
             "jobs": jobs, "latest": latest, "files": files, "i30": i30, "events": all_events,
-            "commands": commands, "do_downloads": [],
+            "commands": commands, "do_downloads": [], "mft_dirs": mft_dirs,
+            "collection": collection_check(inventory, jobs, all_events, i30, mft_dirs),
             "fileslack_urls": slack, "parse_notes": notes}
+
+
+def _ts(s):
+    """ISO-ish UTC string -> aware datetime (None-safe)."""
+    if not s:
+        return None
+    try:
+        s = s.rstrip("Z")[:26]
+        return dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def collection_check(inventory, jobs, events, i30, mft_dirs):
+    """Were the artifacts collected at the same moment? Compares the time window each one covers
+    and, when a raw $MFT is present, the Downloader folder it describes against the copied files."""
+    windows, findings = [], []
+
+    def win(name, times, what):
+        ts = sorted(t for t in (_ts(x) for x in times) if t)
+        if ts:
+            windows.append({"artifact": name, "from": ts[0].isoformat()[:19] + "Z",
+                            "to": ts[-1].isoformat()[:19] + "Z", "basis": what})
+        return ts[-1] if ts else None
+
+    db_jobs = [j for j in jobs if not str(j.get("status", "")).startswith(("event log", "live"))]
+    db_end = win("qmgr.db + ESE logs", [j.get("modified") for j in db_jobs], "job created/modified times")
+    inv = {ntpath.basename(i["file"]).lower(): i for i in inventory}
+    win("copied queue files (file mtimes)", [i.get("mtime") for k, i in inv.items()
+                                             if re.match(r"(qmgr\.(db|jfm)|edb.*\.(log|chk))$", k)],
+        "last write of each copied file (if the copy tool preserved it)")
+    ev_end = win("BITS-Client event log", [e["time"] for e in events], "event times")
+    for src in sorted({e["source"].split("@")[0] for e in i30}):
+        win(src, [t for e in i30 if e["source"].startswith(src + "@")
+                  for t in (e["created"], e["modified"], e["mft_modified"])],
+            "$I30 entry timestamps (%s)" % (", ".join(sorted({str(e.get("dir_path") or e["parent_ref"])
+                                                            for e in i30 if e["source"].startswith(src + "@")}))))
+    for d, info in mft_dirs.items():
+        win("$MFT view of %s" % info["path"], [t for k in info["entries"] for t in (k["modified"], k["mft_changed"])],
+            "$SI times of the folder's entries")
+
+    if db_end and ev_end and (ev_end - db_end).total_seconds() > 3600:
+        n = len([j for j in jobs if j.get("status") == "event log only"])
+        findings.append(("WARN", "The BITS event log runs to %s, %.1f h after the newest database record (%s). "
+                         "Jobs from that gap exist only in the event log (%d event-log-only jobs)."
+                         % (ev_end.isoformat()[:19], (ev_end - db_end).total_seconds() / 3600,
+                            db_end.isoformat()[:19], n)))
+
+    for d, info in mft_dirs.items():
+        if not (info["path"] or "").lower().endswith("\\network\\downloader"):
+            continue
+        live = {k["name"].lower(): k for k in info["entries"] if k["in_use"] and not k["is_dir"]}
+        dead = {k["name"].lower(): k for k in info["entries"] if not k["in_use"]}
+        q = live.get("qmgr.db")
+        if q and db_end and _ts(q["modified"]) and (_ts(q["modified"]) - db_end).total_seconds() > 60:
+            findings.append(("WARN", "Content check: the newest record inside the collected qmgr.db/logs is %s, "
+                             "but the $MFT shows qmgr.db written at %s - the queue files were copied BEFORE "
+                             "the $MFT was captured (independent of file mtimes)"
+                             % (db_end.isoformat()[:19], q["modified"][:19])))
+        i30_by_name = {e["name"].lower(): e for e in i30 if e["parent_ref"] == d}
+        for name, k in sorted(live.items()):
+            got = inv.get(name)
+            if not got:
+                findings.append(("WARN", "%s exists in the $MFT (modified %s) but was NOT collected - "
+                                 "its records are missing from this analysis" % (k["name"], k["modified"])))
+                continue
+            mt, cp = _ts(k["modified"]), _ts(got.get("mtime"))
+            ie = i30_by_name.get(name)
+            from_index = ie is not None and _ts(ie["modified"]) and cp and \
+                abs((_ts(ie["modified"]) - cp).total_seconds()) < 1
+            if mt and cp and (mt - cp).total_seconds() > 2:
+                findings.append(("WARN", "%s: the $MFT shows a later write (%s) than the collected copy (%s)%s"
+                                 % (k["name"], k["modified"], got["mtime"],
+                                    " - NOTE the copy's mtime equals its $I30 index entry: the copy tool took "
+                                    "times from the directory index, which NTFS updates lazily, so this alone "
+                                    "does not prove a later write" if from_index else
+                                    " - the $MFT was captured after the queue files")))
+            elif mt and cp and (cp - mt).total_seconds() > 2:
+                findings.append(("WARN", "%s: the collected copy (%s) is newer than the $MFT entry (%s) "
+                                 "- the $MFT is older than the queue files" % (k["name"], got["mtime"], k["modified"])))
+            else:
+                findings.append(("OK", "%s: size/time in the $MFT match the collected copy" % k["name"]))
+        for name, i in sorted(inv.items()):
+            if re.match(r"(qmgr\.(db|jfm)|edb.*\.(log|chk|jrs))$", name) and name not in live:
+                findings.append(("WARN", "%s was collected but is %s in the $MFT - rotated/removed after collection"
+                                 % (i["file"], "DELETED" if name in dead else "absent")))
+        i30_names = {e["name"].lower() for e in i30 if e["parent_ref"] == d and not e["in_slack"]}
+        if i30_names:
+            only_i30 = sorted(i30_names - set(live) - {"."})
+            only_mft = sorted(set(live) - i30_names)
+            if only_i30 or only_mft:
+                findings.append(("WARN", "Downloader $I30 and $MFT disagree (captured at different times): "
+                                 "only in $I30: %s; only in $MFT: %s" % (only_i30 or "-", only_mft or "-")))
+    if not findings:
+        findings.append(("OK", "No timing inconsistencies detected between the artifacts present"))
+    verdict = "MIXED collection times" if any(f[0] == "WARN" for f in findings) else "consistent"
+    return {"verdict": verdict, "windows": windows,
+            "findings": [{"level": lv, "text": t} for lv, t in findings]}
 
 
 def latest_per_job(jobs):
@@ -1332,9 +1439,10 @@ class RawMft:
             cur = parent
         return drive + "\\" + "\\".join(reversed(parts)), complete
 
-    def scan_names(self, wanted_lower):
-        """One pass over all records: those whose $FN name (any namespace) is in wanted_lower.
-        Fast path reads only $FILE_NAME names (set lookup); full parse only for hits."""
+    def scan_names(self, wanted_lower, parents=frozenset()):
+        """One pass over all records: those whose $FN name (any namespace) is in wanted_lower,
+        or whose $FN parent directory entry is in `parents` (live AND deleted children).
+        Fast path reads only $FILE_NAME (set lookups); full parse only for hits."""
         hits, seen, mm, rs, unpack = [], set(), self.mm, self.rec_size, struct.unpack_from
         for n in range(self.count):
             o = n * rs
@@ -1349,6 +1457,8 @@ class RawMft:
                     break
                 if typ == 0x30 and not mm[p + 8]:
                     c = p + unpack("<H", mm, p + 0x14)[0]
+                    if parents and unpack("<Q", mm, c)[0] & 0xFFFFFFFFFFFF in parents:
+                        hit = True; break
                     nlen = mm[c + 0x40]
                     a, z = c + 0x42 - o, c + 0x42 + 2 * nlen - o
                     if any(a <= k * 512 - 2 < z for k in range(1, rs // 512 + 1)):
@@ -1363,7 +1473,8 @@ class RawMft:
             if hit:
                 rec = self.full_record(n)
                 if rec and rec["entry"] not in seen and \
-                        any(nm.lower() in wanted_lower for _ns, nm, *_ in rec["names"]):
+                        any(nm.lower() in wanted_lower or par in parents
+                            for _ns, nm, par, *_ in rec["names"]):
                     seen.add(rec["entry"])
                     hits.append(rec)
         return hits
@@ -1373,21 +1484,43 @@ def _ft_iso(v):
     return filetime(v) if v else None
 
 
-def correlate_raw_mft(jobs, mft_path, drive="C:"):
-    """Raw $MFT -> for each job's local/tmp path: entry, in use / DELETED, size, $SI/$FN times."""
+def _mft_entry(rec, mft, drive):
+    si = rec["si"] or (None,) * 4
+    bn = RawMft.best_name(rec)
+    path, complete = mft.path_of(rec, drive) if bn else ("", False)
+    return {"name": bn[1] if bn else "", "path": path, "path_complete": complete, "entry": rec["entry"],
+            "seq": rec["seq"], "in_use": rec["in_use"], "is_dir": rec["is_dir"], "size": rec["size"],
+            "created": _ft_iso(si[0]), "modified": _ft_iso(si[1]), "mft_changed": _ft_iso(si[2]),
+            "accessed": _ft_iso(si[3])}
+
+
+def correlate_raw_mft(jobs, mft_path, drive="C:", dirs=()):
+    """Raw $MFT, one pass:
+    - each job's local/tmp path -> entry, in use / DELETED, size, $SI/$FN times
+    - every entry (live + deleted) whose parent is one of `dirs` (MFT entry numbers), e.g. the
+      folders that the collected $I30 files index -> returned as stats["children"][dir]."""
     want = {}
     for j in jobs:
         for f in j.get("files") or []:
             for p in (_remote_local(f)[1], f.get("tmp_file")):
                 if p and re.match(r"^[A-Za-z]:\\", p) and p[:2].upper() == drive.upper():
                     want.setdefault(p.lower(), []).append(f)
-    stats = {"records": 0}
-    if not want:
+    stats = {"records": 0, "children": {}, "dir_paths": {}}
+    dirs = frozenset(d for d in dirs if d)
+    if not want and not dirs:
         return 0, stats
     hits = 0
     with RawMft(mft_path) as mft:
         stats["records"] = mft.count
-        for rec in mft.scan_names({ntpath.basename(p) for p in want}):
+        for d in dirs:
+            r = mft.full_record(d)
+            stats["dir_paths"][d] = mft.path_of(r, drive)[0] if r else None
+        for rec in mft.scan_names({ntpath.basename(p) for p in want}, parents=dirs):
+            for _ns, _nm, par, *_ in rec["names"]:
+                if par in dirs and par != rec["entry"]:        # root's "." points at itself
+                    kids = stats["children"].setdefault(par, [])
+                    if all(k["entry"] != rec["entry"] for k in kids):
+                        kids.append(_mft_entry(rec, mft, drive))
             matched = [(p, c) for p, c in mft.paths_of(rec, drive) if p.lower() in want]
             if not matched:
                 continue
@@ -1471,6 +1604,12 @@ def main(argv=None):
     print("  (%d active/flagged jobs shown; all %d in bits_jobs.csv)" % (shown, len(result["jobs"])))
     for n in result["parse_notes"]:
         print("  [note]", n)
+    c = result["collection"]
+    print("[+] collection check: %s" % c["verdict"])
+    for w in c["windows"]:
+        print("    %-58s %s -> %s" % (w["artifact"][:58], w["from"], w["to"]))
+    for f in c["findings"]:
+        print("    [%s] %s" % (f["level"], f["text"]))
     print("[+] wrote", os.path.abspath(a.output))
 
 

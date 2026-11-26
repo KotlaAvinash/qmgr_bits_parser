@@ -1,6 +1,6 @@
 # qmgr_bits_parser
 
-[![CI](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml/badge.svg)](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml) ![version](https://img.shields.io/badge/version-1.2.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+[![CI](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml/badge.svg)](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml) ![version](https://img.shields.io/badge/version-1.2.1-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 Offline forensic parser, carver and GUI for the **Windows BITS queue** (`qmgr.db`). It recovers active **and deleted** BITS jobs and correlates them with:
 - the BITS event log

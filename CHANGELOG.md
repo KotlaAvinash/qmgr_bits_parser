@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1 - 2026-11-27
+### Fixed
+- The `v1.2.0` commit was missing pieces because a working-copy file was reverted while it was being committed. Missing were the raw-`$MFT` test class, the live-disk ground-truth test, and the "record size from the first valid FILE record" fix. CI flagged it as unused imports. All three are restored here, with no other code change.
+
 ## 1.2.0 - 2026-11-27
 ### Added
 - **Raw `$MFT` support** with no new dependency. A `$MFT` anywhere in the collection folder is scanned in one pass (about 2.7 M records in about 5 s on a real Windows 11 volume). For each job's local and temp file it reports the entry, whether it is in use or **deleted**, size and `$SI`/`$FN` times. It handles:

@@ -636,6 +636,105 @@ class TestSchemaAndPortability(unittest.TestCase):
         self.assertIn("MED: job created by powershell.exe (scripted/manual BITS use)", P.triage(j, []))
 
 
+def synthetic_mft(rec_size=1024):
+    """root(5) > Windows(6) > System32(7); WinSxS(8); Users(9) > Public(10)
+    11 mail.exe DELETED, 12 bitsadmin.exe hard-linked System32+WinSxS, 14 base + 15 extension
+    record holding ext.dll's $FN/$DATA, 16 a long name that crosses the 510 fix-up slot,
+    17 a file whose parent folder slot was reused (sequence mismatch)."""
+    long_name = "x" * 60 + ".exe"
+    r = {
+        5: mft_record(5, [(3, ".", 5, 5)], is_dir=True, seq=5, rec_size=rec_size),
+        6: mft_record(6, [(1, "Windows", 5, 5)], is_dir=True, rec_size=rec_size),
+        7: mft_record(7, [(1, "System32", 6, 1)], is_dir=True, rec_size=rec_size),
+        8: mft_record(8, [(1, "WinSxS", 6, 1)], is_dir=True, rec_size=rec_size),
+        9: mft_record(9, [(1, "Users", 5, 5)], is_dir=True, rec_size=rec_size),
+        10: mft_record(10, [(1, "Public", 9, 1)], is_dir=True, rec_size=rec_size),
+        11: mft_record(11, [(2, "MAIL~1.EXE", 10, 1), (1, "mail.exe", 10, 1)], days=3, size=10,
+                       in_use=False, rec_size=rec_size),
+        12: mft_record(12, [(1, "bitsadmin.exe", 8, 1), (1, "bitsadmin.exe", 7, 1)], days=1, size=227840,
+                       nonres_data=True, rec_size=rec_size),
+        14: mft_record(14, [], days=2, attr_list=((0x10, 14), (0x30, 15), (0x80, 15)), rec_size=rec_size),
+        15: mft_record(15, [(1, "ext.dll", 7, 1)], size=4096, nonres_data=True, base=14, rec_size=rec_size),
+        16: mft_record(16, [(1, long_name, 10, 1)], days=4, size=1, rec_size=rec_size,
+                       pad_before_fn=80),             # shifts the long name across byte 510
+        17: mft_record(17, [(1, "orphan.tmp", 10, 9)], days=5, size=3, rec_size=rec_size),
+    }
+    return mft_image(r, count=20, rec_size=rec_size), long_name
+
+
+class TestRawMft(unittest.TestCase):
+    def _mft(self, d, rec_size=1024):
+        img, long_name = synthetic_mft(rec_size)
+        p = os.path.join(d, "$MFT")
+        with open(p, "wb") as fh:
+            fh.write(img)
+        return p, long_name
+
+    def test_paths_hardlinks_extension_deleted_fixup(self):
+        for rs in (1024, 4096):
+            with tempfile.TemporaryDirectory() as d:
+                p, long_name = self._mft(d, rs)
+                with P.RawMft(p) as m:
+                    self.assertEqual((m.rec_size, m.count), (rs, 20))
+                    hits = {r["entry"]: r for r in m.scan_names(
+                        {"mail.exe", "bitsadmin.exe", "ext.dll", long_name.lower(), "orphan.tmp"})}
+                    self.assertEqual(set(hits), {11, 12, 14, 16, 17}, rs)
+                    self.assertEqual(m.paths_of(hits[11]), [("C:\\Users\\Public\\mail.exe", True)])
+                    self.assertFalse(hits[11]["in_use"])
+                    self.assertEqual(sorted(p for p, _ in m.paths_of(hits[12])),
+                                     ["C:\\Windows\\System32\\bitsadmin.exe", "C:\\Windows\\WinSxS\\bitsadmin.exe"])
+                    self.assertEqual(hits[12]["size"], 227840)
+                    self.assertEqual(hits[14]["size"], 4096)                       # from extension record
+                    self.assertTrue(P.filetime(hits[14]["si"][0]).startswith("2026-01-03"))
+                    self.assertEqual(m.paths_of(hits[14])[0][0], "C:\\Windows\\System32\\ext.dll")
+                    self.assertEqual(m.paths_of(hits[16])[0][0], "C:\\Users\\Public\\" + long_name)
+                    self.assertEqual(m.paths_of(hits[17]), [("C:\\Users\\Public\\orphan.tmp", False)])
+
+    def test_long_name_really_crosses_fixup_slot(self):
+        img, long_name = synthetic_mft()
+        rec = img[16 * 1024:17 * 1024]
+        enc = long_name.encode("utf-16-le")
+        self.assertNotIn(enc, rec)                                  # garbled on disk by the USN...
+        with tempfile.TemporaryDirectory() as d:
+            p, _ = self._mft(d)
+            with P.RawMft(p) as m:
+                self.assertIn(long_name, [nm for ns, nm, *_ in m.record(16)["names"]])   # ...restored by fix-ups
+
+    def test_correlate_and_triage(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, _ = self._mft(d)
+            j, _ = P.parse_job(job_blob())
+            j["files"] = [{"source_url": "http://127.0.0.1/a.exe", "dest_file": "C:\\Users\\Public\\mail.exe",
+                           "tmp_file": "C:\\Users\\Public\\nothere.tmp"}]
+            n, stats = P.correlate_raw_mft([j], p)
+        self.assertEqual((n, stats["records"]), (1, 20))
+        m = j["files"][0]["mft"][0]
+        self.assertEqual((m["entry"], m["in_use"], m["size"]), (11, False, 10))
+        self.assertTrue(m["created"].startswith("2026-01-04"))
+        self.assertTrue(any("DELETED" in t for t in j["triage"]))
+
+    def test_analyse_routes_mft_and_never_carves_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_folder(d, nested=False)
+            img, _ = synthetic_mft()
+            with open(os.path.join(d, "$MFT"), "wb") as fh:          # embed a job blob: must NOT be carved
+                fh.write(img + job_blob(name="inside-mft"))
+            r = P.analyse(d)
+        self.assertTrue(any(n.startswith("raw $MFT") for n in r["parse_notes"]), r["parse_notes"])
+        self.assertNotIn("inside-mft", {j["name"] for j in r["jobs"]})
+
+    def test_garbage_and_empty_mft(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "$MFT")
+            with open(p, "wb") as fh:
+                fh.write(os.urandom(1024 * 30))
+            with P.RawMft(p) as m:
+                self.assertEqual(m.scan_names({"a.exe"}), [])
+                self.assertIsNone(m.record(3))
+            j, _ = P.parse_job(job_blob())
+            self.assertEqual(P.correlate_raw_mft([j], p)[0], 0)
+
+
 class TestDemoData(unittest.TestCase):
     def test_demo_folder_levels_and_links(self):
         import make_demo_data
@@ -759,6 +858,32 @@ class TestGroundTruthThisPC(unittest.TestCase):
                 checked += 1
         if not checked:
             self.skipTest("active jobs no longer live")
+
+    def test_raw_mft_matches_live_disk(self):
+        """Raw $MFT parser vs os.stat on ~50 files that exist now (System32 incl. hard links)."""
+        import datetime as _dt
+        import random as _r
+        mft = os.path.join(EVIDENCE, "$MFT")
+        if not os.path.exists(mft):
+            self.skipTest("no raw $MFT in the evidence folder")
+        s32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+        pool = sorted(os.path.join(s32, f) for f in os.listdir(s32) if os.path.isfile(os.path.join(s32, f)))
+        targets = [os.path.join(s32, "bitsadmin.exe"), os.path.join(s32, "cmd.exe")] + \
+            _r.Random(7).sample(pool, 48)
+        got = {}
+        with P.RawMft(mft) as m:
+            for rec in m.scan_names({os.path.basename(t).lower() for t in targets}):
+                for p, _ok in m.paths_of(rec):
+                    got.setdefault(p.lower(), rec)
+        ok = 0
+        for t in targets:
+            rec, st = got.get(t.lower()), os.stat(t)
+            birth = _dt.datetime.fromtimestamp(getattr(st, "st_birthtime", st.st_ctime),
+                                               _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            ok += bool(rec and rec["in_use"] and rec["size"] == st.st_size and rec["si"]
+                       and P.filetime(rec["si"][0])[:19] == birth)
+        # the snapshot can legitimately differ for files Windows servicing replaced since capture
+        self.assertGreaterEqual(ok, 0.9 * len(targets), "%d/%d matched" % (ok, len(targets)))
 
     def test_evtx_file_equals_live_log(self):
         with tempfile.TemporaryDirectory() as d:

@@ -15,7 +15,7 @@ constants; verified byte-by-byte against a real Windows 11 queue.
 """
 import argparse, csv, datetime as dt, hashlib, json, ntpath, os, re, struct, sys, uuid
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 JOB_DELIMS = [bytes.fromhex(h) for h in (
     "a15609e143afc94292e66f9856eba7f6", "9f95d44c6470f24b84d7476a7e62699f",
@@ -1193,8 +1193,13 @@ class RawMft:
         self._fh = open(path, "rb")
         self.size = os.path.getsize(path)
         self.mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
-        rs = struct.unpack_from("<I", self.mm, 0x1C)[0] if self.mm[:4] == b"FILE" else 1024
-        self.rec_size = rs if rs in (1024, 4096) else 1024
+        rs = 1024                       # record size from the first valid FILE record (record 0
+        for o in range(0, min(self.size, 1 << 20), 1024):   # may be missing in partial copies)
+            if self.mm[o:o + 4] == b"FILE":
+                v = struct.unpack_from("<I", self.mm, o + 0x1C)[0]
+                rs = v if v in (1024, 4096) else 1024
+                break
+        self.rec_size = rs
         self.count = self.size // self.rec_size
         self._names = {}
 

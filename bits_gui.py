@@ -48,7 +48,7 @@ FILE_COLS = [("source_url", 420), ("dest_file", 360), ("download_size", 95), ("t
 EVT_COLS = [("time", 165), ("event_id", 70), ("what", 150), ("job_name", 220), ("job_id", 270),
             ("url", 330), ("local", 280), ("process", 260), ("program_args", 300), ("hr", 95),
             ("owner", 170), ("source", 120)]
-CMD_COLS = [("level", 70), ("time", 160), ("kind", 170), ("text", 700), ("source", 330)]
+CMD_COLS = [("level", 70), ("time", 160), ("kind", 170), ("text", 640), ("note", 260), ("source", 330)]
 DO_COLS = [("level", 70), ("status", 90), ("caller", 210), ("host", 260), ("size", 110),
            ("downloaded", 110), ("from_http", 100), ("from_peers", 95), ("mode", 80), ("expires", 160),
            ("source_url", 500)]

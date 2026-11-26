@@ -27,9 +27,13 @@ except (OSError, ValueError):
     EXPECT = {}
 EVIDENCE = os.environ.get("BITS_EVIDENCE") or EXPECT.get("evidence") or ""
 HAVE_EVIDENCE = bool(EVIDENCE) and os.path.exists(os.path.join(EVIDENCE, "qmgr.db"))
+# exact expectations describe ONE export; never apply them to a different folder
+if EXPECT.get("evidence") and EVIDENCE and \
+        os.path.normcase(os.path.abspath(EVIDENCE)) != os.path.normcase(os.path.abspath(EXPECT["evidence"])):
+    EXPECT = {}
 
 
-from bits_synth import ustr, ftb, job_blob, file_blob, indx_block, sd_blob  # noqa: E402
+from bits_synth import ustr, ftb, job_blob, file_blob, indx_block, sd_blob, mft_record, mft_image  # noqa: E402
 
 
 def make_folder(root, nested=True, corrupt_db=False, extra=None):
@@ -494,6 +498,28 @@ class TestExtraSources(unittest.TestCase):
         self.assertEqual(out[1]["level"], "HIGH")
         self.assertEqual(P.scan_ps_history(os.path.join(HERE, "nope.txt")), [])
 
+    def test_4103_command_only_in_contextinfo(self):
+        """Regression: 4103 events keep the host command line in ContextInfo, not Payload."""
+        own = ("$ErrorActionPreference='Stop' @(Get-BitsTransfer | ForEach-Object { [pscustomobject]@{ "
+               "job_id=$_.JobId.ToString(); notify_cmd=$_.NotifyCmdLine[0] } })")
+        evs = P.read_events(raw_json=json.dumps([
+            {"id": 4103, "time": "2026-11-27T02:23:46Z", "record": 1,
+             "channel": "Microsoft-Windows-PowerShell/Operational", "message": "CommandInvocation(Add-Type)",
+             "data": {"Payload": 'CommandInvocation(Add-Type): "Add-Type"',
+                      "ContextInfo": "Host Application = powershell -NonInteractive -Command " + own}},
+            {"id": 4103, "time": "2026-11-27T02:24:00Z", "record": 2,
+             "channel": "Microsoft-Windows-PowerShell/Operational", "message": "x",
+             "data": {"Payload": "CommandInvocation(Out-Null)",
+                      "ContextInfo": "Host Application = powershell -c $j.SetNotifyCmdLine('c:\\u\\x.exe','')"}}]))
+        cmds = P.commands_from_events(evs)
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual((cmds[0]["level"], cmds[0].get("note") is not None), ("INFO", True))  # own query
+        self.assertEqual((cmds[1]["level"], cmds[1].get("note")), ("HIGH", None))              # sets notify
+
+    def test_reading_notifycmdline_is_not_high(self):
+        self.assertEqual(P.command_level("Get-BitsTransfer | select DisplayName, NotifyCmdLine"), "INFO")
+        self.assertEqual(P.command_level("$job.SetNotifyCmdLine('c:\\x.exe', '')"), "HIGH")
+
     def test_commands_from_ps_events(self):
         evs = P.read_events(raw_json=json.dumps([
             {"id": 4104, "time": "2026-11-27T01:00:00Z", "record": 9, "channel": "Microsoft-Windows-PowerShell/Operational",
@@ -579,6 +605,37 @@ class TestExtraSources(unittest.TestCase):
         self.assertIn(P.__version__, buf.getvalue())
 
 
+class TestSchemaAndPortability(unittest.TestCase):
+    def test_every_job_has_full_schema(self):
+        """Regression: event-log-only and live jobs used to miss 26 keys (KeyError: 'owner_sid')."""
+        with tempfile.TemporaryDirectory() as d:
+            make_folder(d, nested=False)
+            r = P.analyse(d, events=P.read_events(raw_json=EVT_JSON))
+        kinds = {j["status"] for j in r["jobs"]}
+        self.assertIn("event log only", kinds)
+        self.assertIn("deleted/recovered", kinds)
+        for j in r["jobs"] + P.live_jobs(raw_json=LIVE_JSON):
+            self.assertEqual(set(P.JOB_SCHEMA) - set(j), set(), (j["status"], j["name"]))
+            j["owner_sid"], j["priority"], j["description"]                 # no KeyError
+        only = [j for j in r["jobs"] if j["status"] == "event log only"][0]
+        self.assertIsNone(only["owner_sid"]); self.assertEqual(only["file_ids"], [])
+        with mock.patch.object(P, "_ps", side_effect=[LIVE_JSON, EVT_JSON]):
+            jobs, _ = P.live_snapshot()
+        for j in jobs:
+            self.assertEqual(set(P.JOB_SCHEMA) - set(j), set())
+
+    def test_normalize_does_not_share_mutable_defaults(self):
+        a, b = P.normalize_job({}), P.normalize_job({})
+        a["errors"].append(1)
+        self.assertEqual(b["errors"], [])
+
+    def test_windows_paths_parsed_on_any_os(self):
+        """Regression (Linux CI): creator basename must split on '\\' everywhere."""
+        j, _ = P.parse_job(job_blob(creator="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+                                    cmd="", errors=0, state=6, name="x"))
+        self.assertIn("MED: job created by powershell.exe (scripted/manual BITS use)", P.triage(j, []))
+
+
 class TestDemoData(unittest.TestCase):
     def test_demo_folder_levels_and_links(self):
         import make_demo_data
@@ -614,7 +671,10 @@ class TestRealEvidence(unittest.TestCase):
 
     def test_all_records_have_valid_times_and_sids(self):
         for j in self.r["jobs"]:
-            self.assertTrue(j.get("created"), j["source"])
+            self.assertEqual(set(P.JOB_SCHEMA) - set(j), set(), j["source"])   # uniform schema
+            if j["status"] == "event log only":
+                continue        # no DB record: owner SID unknown, created only if EID 3 survived
+            self.assertTrue(j["created"], j["source"])
             self.assertRegex(j["owner_sid"], r"^S-1-\d+(-\d+)+$")
             self.assertIn(j["state"], P.JOB_STATE.values())
 
@@ -650,10 +710,20 @@ class TestRealEvidence(unittest.TestCase):
             self.assertEqual((f["download_size"], f["transfer_size"]),
                              (k["download_size"], k["transfer_size"]))
             self.assertEqual(j["created"], k["created"])
-        if "allowed_levels" in EXPECT:
-            self.assertTrue({j["level"] for j in self.r["latest"]} <= set(EXPECT["allowed_levels"]))
-        if "i30_names" in EXPECT:
-            self.assertEqual({e["name"] for e in self.r["i30"]}, set(EXPECT["i30_names"]))
+        db = [j for j in self.r["latest"] if j["status"] != "event log only"]
+        if "allowed_levels" in EXPECT:          # applies to database/carved records
+            self.assertTrue({j["level"] for j in db} <= set(EXPECT["allowed_levels"]),
+                            {j["name"]: j["level"] for j in db if j["level"] not in EXPECT["allowed_levels"]})
+        if "event_only_high" in EXPECT:         # exactly these event-log-only jobs are HIGH
+            self.assertEqual(sorted(j["name"] for j in self.r["latest"]
+                                    if j["status"] == "event log only" and j["level"] == "HIGH"),
+                             sorted(EXPECT["event_only_high"]))
+        if "commands" in EXPECT:
+            self.assertEqual(len(self.r["commands"]), EXPECT["commands"])
+            self.assertTrue(all(c["level"] == "INFO" for c in self.r["commands"]))
+        if "i30_names" in EXPECT:               # Downloader index entries must be present
+            missing = set(EXPECT["i30_names"]) - {e["name"] for e in self.r["i30"]}
+            self.assertEqual(missing, set())
 
 
 def _live_events_available():

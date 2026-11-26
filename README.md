@@ -1,6 +1,6 @@
 # qmgr_bits_parser
 
-[![CI](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml/badge.svg)](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml) ![version](https://img.shields.io/badge/version-1.1.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
+[![CI](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml/badge.svg)](https://github.com/KotlaAvinash/qmgr_bits_parser/actions/workflows/ci.yml) ![version](https://img.shields.io/badge/version-1.2.0-blue) ![license](https://img.shields.io/badge/license-MIT-green)
 
 Offline forensic parser, carver and GUI for the **Windows BITS queue** (`qmgr.db`). It recovers active **and deleted** BITS jobs and correlates them with:
 - the BITS event log
@@ -31,7 +31,7 @@ Completed and cancelled jobs are deleted from the queue, but their records often
 | **BITS command hunting** | Finds `bitsadmin`, `*-BitsTransfer`, `SetNotifyCmdLine` and BITS COM usage in PSReadLine `ConsoleHost_history.txt` and in PowerShell 4103/4104 events |
 | **Delivery Optimization** | Live DO cache: Windows Update, Store and Office downloads that **bypass BITS**, with the calling application |
 | **Payload check** | On the live disk or a `--mount-root` image: does each job's local file still exist? Size, mtime and SHA-256 |
-| **`$MFT`** | With an MFTECmd CSV in the folder: each local/temp file's MFT entry, whether it is in use or **deleted**, and its timestamps |
+| **`$MFT`** | A raw `$MFT` (native parser, no extra dependency) or an MFTECmd CSV in the folder: each local/temp file's MFT entry, whether it is in use or **deleted**, size and `$SI`/`$FN` times. Hard links, extension records and fix-ups are handled |
 | **Live snapshot** | `Get-BitsTransfer`, the event logs, PowerShell history and the DO cache, no admin needed |
 | **Triage** | HIGH / MED / REVIEW / INFO, with an exact-domain allowlist for known updaters |
 | **GUI** | Tkinter: Jobs / Files / Events / Commands / Delivery Opt. / `$I30` / Evidence tabs, filters, an event timeline per job, light/dark theme, export |
@@ -73,7 +73,7 @@ These optional extras add context. Drop them anywhere in the collection folder a
 | `Microsoft-Windows-Bits-Client%4Operational.evtx` | Creating process, notify command, URLs, errors, cancelled jobs |
 | `Microsoft-Windows-PowerShell%4Operational.evtx` | Script blocks that used BITS |
 | `ConsoleHost_history.txt` (each user's `%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\`) | Typed bitsadmin / BitsTransfer commands |
-| MFTECmd `$MFT` CSV | Whether the downloaded payload landed or was deleted |
+| Raw `$MFT` or an MFTECmd `$MFT` CSV | Whether the downloaded payload landed or was deleted |
 
 The BITS log can be exported without admin:
 ```powershell
@@ -126,6 +126,7 @@ These were verified on a real Windows 11 host: a known test job's notify command
 - File sizes: the first u64 is bytes transferred and the second is the total (–1 means unknown). This matched `Get-BitsTransfer` for 10/10 live jobs.
 - Windows 10+ job tail: the creating process path, an optional package family + `!AppId`, and the HTTP verb. The creator path matched event 3 `processPath` for 479/479 jobs.
 - The FILETIME at file-record offset +29 is the server's Last-Modified time, not a creation time. `expiration` is completion + 90 days.
+- The raw `$MFT` parser was checked against `os.stat` for 60 live files: 59 matched exactly on size, creation time and in-use flag. The 1 exception had been replaced by Windows servicing after the snapshot.
 
 ## Limits: what it does not see
 - **Non-BITS downloads.** Browser downloads, winget, curl/`Invoke-WebRequest` and custom updaters. Delivery Optimization (most Windows Update/Store traffic) is covered only as a **live** snapshot, because its log needs admin.
@@ -139,7 +140,7 @@ These were verified on a real Windows 11 host: a known test job's notify command
 ```powershell
 .\.venv\Scripts\python -m unittest -v test_bits_qmgr_parser
 ```
-67 tests. CI runs them on Windows with Python 3.10–3.13, again with the pinned requirements, on Linux (core parser only), and checks that the wheel builds. They cover:
+78 tests. CI runs them on Windows with Python 3.10–3.13, again with the pinned requirements, on Linux (core parser only), and checks that the wheel builds. They cover:
 - unit, triage and allowlist-bypass checks
 - fuzzing and truncation
 - full pipeline and command line
@@ -148,6 +149,8 @@ These were verified on a real Windows 11 host: a known test job's notify command
 - Delivery Optimization
 - payload checks, including path-escape attempts
 - MFT CSV correlation
+- raw `$MFT` parsing: fix-ups, hard links, extension records, deleted files, 1K/4K records
+- a uniform job schema across all sources
 - a GUI smoke test
 - synthetic demo data
 

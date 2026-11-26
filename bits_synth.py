@@ -91,3 +91,72 @@ def indx_block(live, slack):
     for i, n in enumerate(slack):
         e = fn_entry(n, 10 + i); b[s:s + len(e)] = e; s += len(e) + 8
     return bytes(b)
+
+
+# ---------------------------------------------------------------- synthetic $MFT
+def _ft(days):
+    return int(((dt.datetime(2026, 1, 1) + dt.timedelta(days=days)) - dt.datetime(1601, 1, 1)).total_seconds()
+               * 10_000_000)
+
+
+def _attr_res(typ, content, attr_id=0):
+    hdr_len = 0x18
+    ln = (hdr_len + len(content) + 7) & ~7
+    return (struct.pack("<IIBBHHH", typ, ln, 0, 0, 0, 0, attr_id) +
+            struct.pack("<IHBB", len(content), hdr_len, 0, 0) + content).ljust(ln, b"\x00")
+
+
+def _attr_nonres_data(real_size):
+    ln = 0x48
+    return (struct.pack("<IIBBHHH", 0x80, ln, 1, 0, 0, 0, 3) +
+            struct.pack("<QQHH4xQQQ", 0, 0, 0x40, 0, real_size, real_size, real_size) + bytes(8))
+
+
+def mft_record(entry, names=(), days=0, size=None, in_use=True, is_dir=False, seq=1, base=0,
+               attr_list=(), rec_size=1024, nonres_data=False, pad_before_fn=0):
+    """One NTFS FILE record with update-sequence fix-ups applied (as on disk).
+    names: (namespace, name, parent_entry, parent_seq). attr_list: (type, ext_entry) tuples."""
+    attrs = b""
+    if not base:
+        attrs += _attr_res(0x10, struct.pack("<4Q", _ft(days), _ft(days + 1), _ft(days + 2), _ft(days + 3))
+                           + bytes(16))
+    if attr_list:
+        al = b""
+        for typ, ext in attr_list:
+            al += struct.pack("<IHBBQQH6x", typ, 0x20, 0, 0x1A, 0, (1 << 48) | ext, 0)
+        attrs += _attr_res(0x20, al)
+    if pad_before_fn and names:                               # valid filler: a DOS-name $FN
+        names = [(2, "~" * pad_before_fn, names[0][2], names[0][3])] + list(names)
+    for ns, nm, par, par_seq in names:
+        enc = nm.encode("utf-16-le")
+        fn = struct.pack("<Q", (par_seq << 48) | par) + struct.pack("<4Q", *[_ft(days)] * 4) + \
+            struct.pack("<QQII", 0, size or 0, 0x20, 0) + bytes([len(nm), ns]) + enc
+        attrs += _attr_res(0x30, fn)
+    if size is not None:
+        attrs += _attr_nonres_data(size) if nonres_data else _attr_res(0x80, bytes(size))
+    attrs += struct.pack("<I", 0xFFFFFFFF) + bytes(4)
+    usa_cnt = rec_size // 512 + 1
+    attr_off = (0x30 + 2 * usa_cnt + 7) & ~7
+    flags = (1 if in_use else 0) | (2 if is_dir else 0)
+    b = bytearray(rec_size)
+    b[0:4] = b"FILE"
+    struct.pack_into("<HHQHHHHII", b, 4, 0x30, usa_cnt, 0, seq, 1, attr_off, flags,
+                     attr_off + len(attrs), rec_size)
+    struct.pack_into("<QHHI", b, 0x20, (1 << 48) | base if base else 0, 0, 0, entry)
+    b[attr_off:attr_off + len(attrs)] = attrs
+    usn = b"\x07\x00"
+    b[0x30:0x32] = usn
+    for i in range(1, usa_cnt):                                   # fix-ups: save + overwrite
+        pos = i * 512 - 2
+        b[0x30 + 2 * i:0x30 + 2 * i + 2] = b[pos:pos + 2]
+        b[pos:pos + 2] = usn
+    return bytes(b)
+
+
+def mft_image(records, count=None, rec_size=1024):
+    """dict entry -> record bytes  ->  $MFT image (empty slots are zero-filled)."""
+    n = count or (max(records) + 1)
+    img = bytearray(n * rec_size)
+    for e, r in records.items():
+        img[e * rec_size:(e + 1) * rec_size] = r
+    return bytes(img)

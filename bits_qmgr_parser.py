@@ -13,9 +13,9 @@ Evidence is opened read-only and SHA-256 hashed. Output: JSON, CSV, triage.
 Layout reference: ANSSI-FR bits_parser structs.py + FireEye BitsParser
 constants; verified byte-by-byte against a real Windows 11 queue.
 """
-import argparse, csv, datetime as dt, hashlib, json, os, re, struct, sys, uuid
+import argparse, csv, datetime as dt, hashlib, json, ntpath, os, re, struct, sys, uuid
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 JOB_DELIMS = [bytes.fromhex(h) for h in (
     "a15609e143afc94292e66f9856eba7f6", "9f95d44c6470f24b84d7476a7e62699f",
@@ -531,7 +531,7 @@ def triage(job, files):
         flags.append("MED: generic 'update' style job name")
     creator = job.get("creator_process_inferred") or job.get("creator_process_evt") or ""
     if ATTACKER_CREATORS.search(creator):
-        flags.append("MED: job created by %s (scripted/manual BITS use)" % os.path.basename(creator))
+        flags.append("MED: job created by %s (scripted/manual BITS use)" % ntpath.basename(creator))
     elif creator and USER_WRITABLE.search(creator):
         flags.append("MED: job created by a process in a user-writable path: " + creator)
     for f in files:
@@ -580,6 +580,27 @@ def retriage(j):
     return j
 
 
+# Every job record - DB, carved, event-log-only or live - carries every key, so consumers
+# (CSV, GUI, scripts) never hit a KeyError. None = "not known from this source".
+JOB_SCHEMA = {
+    "job_id": "", "name": "", "description": None, "status": "", "state": "", "job_type": "",
+    "priority": None, "owner_sid": None, "owner": None, "created": None, "modified": None,
+    "transfer_completed": None, "expiration": None, "notify_cmd": "", "notify_args": "",
+    "notify_flags": None, "notify_cmd_evt": None, "notify_args_evt": None, "retry_delay_s": None,
+    "no_progress_timeout_s": None, "transient_error_count": None, "errors": [], "file_ids": [],
+    "files": [], "events": [], "creator_process_inferred": None, "creator_process_evt": None,
+    "creator_aumid_inferred": None, "http_method": None, "sd_owner_sid": None, "sd_group_sid": None,
+    "sd_dacl": [], "sd_sddl": None, "tail_complete": None, "source": [], "triage": [], "level": "",
+}
+
+
+def normalize_job(j):
+    for k, v in JOB_SCHEMA.items():
+        if k not in j:
+            j[k] = list(v) if isinstance(v, list) else v
+    return j
+
+
 def _walk(input_dir):
     """All files below input_dir (KAPE exports nest the Downloader path)."""
     for root, dirs, fns in os.walk(input_dir):
@@ -601,7 +622,7 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
     say = progress or (lambda m: None)
     inventory, all_jobs, all_files, notes = [], [], [], []
     ese_files = {}
-    i30, slack, evtx_events, commands, mft_csvs = [], {}, [], [], []
+    i30, slack, evtx_events, commands, mft_csvs, raw_mfts = [], {}, [], [], [], []
     for p, rel in _walk(input_dir):
         fn = os.path.basename(p)
         low = fn.lower()
@@ -634,6 +655,10 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
             if is_mftecmd_csv(p):
                 mft_csvs.append(p)
             continue
+        if low == "$mft" or low.startswith("$mft."):
+            raw_mfts.append(p); continue                  # NTFS metadata: parse, never carve
+        if low.startswith(("$logfile", "$usnjrnl", "$j", "$secure", "$boot", "$bitmap")):
+            continue
         if low.endswith((".txt", ".json", ".md")):
             continue
         if not no_carve and not low.endswith((".chk", ".jfm")):
@@ -664,7 +689,7 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
         j["files"] = [{k: v for k, v in f.items() if k != "source"} for f in linked]
 
     all_events = evtx_events + list(events or [])
-    jobs = correlate(jobs, all_events, "event log only")
+    jobs = [normalize_job(j) for j in correlate(jobs, all_events, "event log only")]
     if mount_root:
         say("checking local files under " + mount_root)
         check_files(jobs, mount_root)
@@ -674,6 +699,14 @@ def analyse(input_dir, no_carve=False, progress=None, events=None, mount_root=No
             notes.append("$MFT CSV %s: %d matches" % (os.path.basename(c), correlate_mft(jobs, c, mft_drive)))
         except Exception as e:
             notes.append("$MFT CSV %s: %s" % (os.path.basename(c), e))
+    for m in raw_mfts:
+        say("scanning raw $MFT %s (one pass)" % os.path.basename(m))
+        try:
+            n, stats = correlate_raw_mft(jobs, m, mft_drive)
+            notes.append("raw $MFT %s: %d records scanned, %d matches"
+                         % (os.path.basename(m), stats["records"], n))
+        except Exception as e:
+            notes.append("raw $MFT %s: %s: %s" % (os.path.basename(m), type(e).__name__, e))
     for j in jobs:
         retriage(j)
     jobs.sort(key=lambda j: (j.get("created") or "", j.get("modified") or ""))
@@ -752,7 +785,7 @@ def write_outputs(result, out_dir):
             w.writerows(row_safe(e) for e in result["events"])
     if result.get("commands"):
         with open(os.path.join(out_dir, "bits_commands.csv"), "w", newline="", encoding="utf-8-sig") as fh:
-            w = csv.DictWriter(fh, ["level", "time", "kind", "text", "source", "record", "line_no"],
+            w = csv.DictWriter(fh, ["level", "time", "kind", "text", "note", "source", "record", "line_no"],
                                extrasaction="ignore"); w.writeheader()
             w.writerows(row_safe(c) for c in result["commands"])
     if result.get("do_downloads"):
@@ -826,7 +859,10 @@ def normalize_event(e, source):
             "hr": hr if hr not in ("0x00000000",) else "", "bytes_total": d.get("bytesTotal"),
             "bytes_transferred": d.get("bytesTransferred"), "record": e.get("record"),
             "channel": e.get("channel") or "Microsoft-Windows-Bits-Client/Operational",
-            "script": d.get("ScriptBlockText") or d.get("Payload") or d.get("ContextInfo") or "",
+            # 4104 -> ScriptBlockText; 4103 -> Payload (pipeline detail) AND ContextInfo (the
+            # host command line). Keep all of them: the BITS call is often only in ContextInfo.
+            "script": "\n".join(v for v in (d.get("ScriptBlockText"), d.get("Payload"),
+                                            d.get("ContextInfo")) if v),
             "source": source, "message": e.get("message") or ""}
 
 
@@ -930,7 +966,7 @@ def live_snapshot():
         events = []
         for j in jobs:
             j.setdefault("notes", []).append("event log unavailable: %s" % e)
-    jobs = correlate(jobs, events, "event log only (live)")
+    jobs = [normalize_job(j) for j in correlate(jobs, events, "event log only (live)")]
     check_files(jobs)                       # live disk: does the payload still exist? hash it
     return jobs, events
 
@@ -984,7 +1020,7 @@ def live_jobs(raw_json=None):
         j["source"] = ["Get-BitsTransfer"]
         j["triage"] = triage(j, files)
         j["level"] = level_of(j["triage"])
-        jobs.append(j)
+        jobs.append(normalize_job(j))
     return jobs
 
 
@@ -996,7 +1032,7 @@ BITS_CMD_RE = re.compile(r"\bbitsadmin(\.exe)?\b|\b(Start|Get|Set|Add|Complete|R
 
 def command_level(text):
     t = text or ""
-    if re.search(r"SetNotifyCmdLine|/SetNotifyCmdLine|NotifyCmdLine", t, re.I):
+    if re.search(r"SetNotifyCmdLine", t, re.I):          # setting it, not merely reading .NotifyCmdLine
         return "HIGH"
     urls = re.findall(r"[a-z][a-z0-9+.-]*://[^\s'\"<>]+", t, re.I)
     if any(url_host(u).startswith("127.") or url_host(u) == "localhost" for u in urls):
@@ -1012,6 +1048,9 @@ def _cmd(source, text, time=None, kind="", extra=None):
     s = max(0, (m.start() if m else 0) - 150)
     snippet = (text or "")[s:s + 500].replace("\r", " ").replace("\n", " ⏎ ")
     d = {"time": time, "kind": kind, "source": source, "text": snippet, "level": command_level(text)}
+    if "[pscustomobject]@{" in (text or "") and "job_id=$_.JobId.ToString()" in (text or ""):
+        d["note"] = "read-only query made by bits-qmgr's own live mode"
+        d["level"] = "INFO"
     d.update(extra or {})
     return d
 
@@ -1034,7 +1073,7 @@ def commands_from_events(events):
     """PowerShell 4103/4104 (or any non-BITS channel) events that mention BITS."""
     out = []
     for e in events:
-        txt = e.get("script") or e.get("message") or ""
+        txt = "\n".join(x for x in (e.get("script"), e.get("message")) if x)
         if BITS_CMD_RE.search(txt):
             out.append(_cmd(e.get("source"), txt, e.get("time"), "%s %s" % (
                 (e.get("channel") or "").split("/")[0].replace("Microsoft-Windows-", ""), e["event_id"]),
@@ -1143,6 +1182,223 @@ def correlate_mft(jobs, csv_path, drive="C:"):
     for j in jobs:
         retriage(j)
     return hits
+
+
+class RawMft:
+    """Minimal read-only $MFT parser (file records, fix-ups, $SI/$FN/$DATA, path resolution).
+    Only what is needed to answer: did this path exist, is it deleted, size, timestamps."""
+
+    def __init__(self, path):
+        import mmap
+        self._fh = open(path, "rb")
+        self.size = os.path.getsize(path)
+        self.mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        rs = struct.unpack_from("<I", self.mm, 0x1C)[0] if self.mm[:4] == b"FILE" else 1024
+        self.rec_size = rs if rs in (1024, 4096) else 1024
+        self.count = self.size // self.rec_size
+        self._names = {}
+
+    def close(self):
+        self.mm.close(); self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def record(self, n):
+        """Parsed record n or None. Applies update-sequence fix-ups on a private copy."""
+        o = n * self.rec_size
+        if o + self.rec_size > self.size or self.mm[o:o + 4] != b"FILE":
+            return None
+        b = bytearray(self.mm[o:o + self.rec_size])
+        usa_off, usa_cnt = struct.unpack_from("<HH", b, 4)
+        if usa_off + 2 * usa_cnt > len(b):
+            return None
+        for i in range(1, usa_cnt):
+            pos = i * 512 - 2
+            if pos + 2 <= len(b):
+                b[pos:pos + 2] = b[usa_off + 2 * i:usa_off + 2 * i + 2]
+        seq, _links, attr_off, flags = struct.unpack_from("<HHHH", b, 0x10)
+        base = struct.unpack_from("<Q", b, 0x20)[0] & 0xFFFFFFFFFFFF
+        rec = {"entry": n, "seq": seq, "in_use": bool(flags & 1), "is_dir": bool(flags & 2),
+               "names": [], "si": None, "size": None, "base": base, "attr_list": []}
+        p = attr_off
+        while p + 16 <= len(b):
+            typ, ln = struct.unpack_from("<II", b, p)
+            if typ == 0xFFFFFFFF or ln < 16 or p + ln > len(b):
+                break
+            nonres, name_len = b[p + 8], b[p + 9]
+            if not nonres:
+                csz, coff = struct.unpack_from("<IH", b, p + 0x10)
+                c = p + coff
+                if typ == 0x10 and csz >= 32:
+                    rec["si"] = struct.unpack_from("<4Q", b, c)
+                elif typ == 0x30 and csz >= 0x42:
+                    par = struct.unpack_from("<Q", b, c)[0]
+                    times = struct.unpack_from("<4Q", b, c + 8)
+                    nlen, ns = b[c + 0x40], b[c + 0x41]
+                    try:
+                        nm = bytes(b[c + 0x42:c + 0x42 + 2 * nlen]).decode("utf-16-le")
+                    except UnicodeDecodeError:
+                        nm = None
+                    if nm is not None:
+                        rec["names"].append((ns, nm, par & 0xFFFFFFFFFFFF, par >> 48, times))
+                elif typ == 0x80 and name_len == 0:
+                    rec["size"] = csz
+                elif typ == 0x20:                      # resident $ATTRIBUTE_LIST
+                    q = c
+                    while q + 26 <= c + csz:
+                        a_typ, a_len = struct.unpack_from("<IH", b, q)
+                        a_nlen = b[q + 6]
+                        a_ref = struct.unpack_from("<Q", b, q + 16)[0] & 0xFFFFFFFFFFFF
+                        if a_len < 26:
+                            break
+                        rec["attr_list"].append((a_typ, a_nlen, a_ref))
+                        q += a_len
+            elif typ == 0x80 and name_len == 0 and rec["size"] is None:
+                rec["size"] = struct.unpack_from("<Q", b, p + 0x30)[0]     # real size
+            p += ln
+        return rec
+
+    def full_record(self, n):
+        """Record n merged with its extension records: base $SI/flags + every $FN and $DATA size,
+        whether the hit was found in the base or in an extension record."""
+        rec = self.record(n)
+        if rec is None:
+            return None
+        if rec["base"] and rec["base"] != n:
+            base = self.record(rec["base"])
+            if base is None:
+                return rec
+            rec = base
+        for a_typ, a_nlen, a_ref in rec["attr_list"]:
+            if a_ref == rec["entry"] or a_typ not in (0x30, 0x80):
+                continue
+            ext = self.record(a_ref)
+            if not ext:
+                continue
+            for nm in ext["names"]:
+                if nm not in rec["names"]:
+                    rec["names"].append(nm)
+            if a_typ == 0x80 and a_nlen == 0 and rec["size"] is None:
+                rec["size"] = ext["size"]
+        return rec
+
+    @staticmethod
+    def best_name(rec):
+        names = sorted(rec["names"], key=lambda x: {1: 0, 3: 1, 0: 2, 2: 3}.get(x[0], 4))
+        return names[0] if names else None
+
+    def paths_of(self, rec, drive="C:"):
+        """Every path of a record: one per hard link (distinct non-DOS $FILE_NAME parent/name).
+        System32 binaries, for example, are hard links shared with WinSxS."""
+        out, seen = [], set()
+        for ns, nm, par, par_seq, t in rec["names"]:
+            if ns == 2 or (nm.lower(), par) in seen:
+                continue
+            seen.add((nm.lower(), par))
+            out.append(self.path_of(dict(rec, names=[(ns, nm, par, par_seq, t)]), drive))
+        return out or [self.path_of(rec, drive)]
+
+    def path_of(self, rec, drive="C:"):
+        """Full path via parent chain. Returns (path, complete). complete=False if a parent was
+        reused (sequence mismatch) - typical for deleted files in deleted folders."""
+        parts, cur, complete, seen = [], rec, True, set()
+        for _ in range(255):
+            bn = self.best_name(cur)
+            if not bn:
+                complete = False; break
+            _ns, nm, par, par_seq, _t = bn
+            if cur["entry"] == 5:
+                break
+            parts.append(nm)
+            if par in seen:
+                complete = False; break
+            seen.add(par)
+            if par not in self._names:
+                self._names[par] = self.record(par)
+            parent = self._names[par]
+            if parent is None:
+                complete = False; break
+            if parent["seq"] != par_seq and par != 5:
+                complete = False
+            cur = parent
+        return drive + "\\" + "\\".join(reversed(parts)), complete
+
+    def scan_names(self, wanted_lower):
+        """One pass over all records: those whose $FN name (any namespace) is in wanted_lower.
+        Fast path reads only $FILE_NAME names (set lookup); full parse only for hits."""
+        hits, seen, mm, rs, unpack = [], set(), self.mm, self.rec_size, struct.unpack_from
+        for n in range(self.count):
+            o = n * rs
+            if mm[o:o + 4] != b"FILE":
+                continue
+            p = o + unpack("<H", mm, o + 0x14)[0]
+            end = o + rs
+            hit = False
+            while p + 16 <= end:
+                typ, ln = unpack("<II", mm, p)
+                if typ == 0xFFFFFFFF or ln < 16 or typ > 0x30:
+                    break
+                if typ == 0x30 and not mm[p + 8]:
+                    c = p + unpack("<H", mm, p + 0x14)[0]
+                    nlen = mm[c + 0x40]
+                    a, z = c + 0x42 - o, c + 0x42 + 2 * nlen - o
+                    if any(a <= k * 512 - 2 < z for k in range(1, rs // 512 + 1)):
+                        hit = True; break       # name crosses a fix-up slot: verify with full parse
+                    raw = mm[c + 0x42:c + 0x42 + 2 * nlen]
+                    try:
+                        if raw.decode("utf-16-le").lower() in wanted_lower:
+                            hit = True; break
+                    except UnicodeDecodeError:
+                        hit = True; break       # possibly a fix-up inside the name: verify below
+                p += ln
+            if hit:
+                rec = self.full_record(n)
+                if rec and rec["entry"] not in seen and \
+                        any(nm.lower() in wanted_lower for _ns, nm, *_ in rec["names"]):
+                    seen.add(rec["entry"])
+                    hits.append(rec)
+        return hits
+
+
+def _ft_iso(v):
+    return filetime(v) if v else None
+
+
+def correlate_raw_mft(jobs, mft_path, drive="C:"):
+    """Raw $MFT -> for each job's local/tmp path: entry, in use / DELETED, size, $SI/$FN times."""
+    want = {}
+    for j in jobs:
+        for f in j.get("files") or []:
+            for p in (_remote_local(f)[1], f.get("tmp_file")):
+                if p and re.match(r"^[A-Za-z]:\\", p) and p[:2].upper() == drive.upper():
+                    want.setdefault(p.lower(), []).append(f)
+    stats = {"records": 0}
+    if not want:
+        return 0, stats
+    hits = 0
+    with RawMft(mft_path) as mft:
+        stats["records"] = mft.count
+        for rec in mft.scan_names({ntpath.basename(p) for p in want}):
+            matched = [(p, c) for p, c in mft.paths_of(rec, drive) if p.lower() in want]
+            if not matched:
+                continue
+            path, complete = matched[0]
+            si = rec["si"] or (None,) * 4
+            fn = (RawMft.best_name(rec) or (None,) * 5)[4] or (None,) * 4
+            for f in want[path.lower()]:
+                f.setdefault("mft", []).append({
+                    "in_use": rec["in_use"], "entry": rec["entry"], "seq": rec["seq"], "size": rec["size"],
+                    "created": _ft_iso(si[0]), "modified": _ft_iso(si[1]), "mft_changed": _ft_iso(si[2]),
+                    "accessed": _ft_iso(si[3]), "fn_created": _ft_iso(fn[0]), "path_complete": complete,
+                    "source": "raw " + os.path.basename(mft_path)})
+                hits += 1
+    for j in jobs:
+        retriage(j)
+    return hits, stats
 
 
 def file_status_flags(files):
